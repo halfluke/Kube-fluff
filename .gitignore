@@ -1,0 +1,12 @@
+# Terraform (all terraform/ modules and future stacks)
+**/.terraform/
+**/.terraform/**
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfvars
+!**/terraform.tfvars.example
+crash.log
+override.tf
+override.tf.json
+.terraformrc
+terraform.rc

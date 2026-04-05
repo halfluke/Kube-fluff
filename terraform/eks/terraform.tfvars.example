@@ -1,0 +1,18 @@
+# Copy to terraform.tfvars and adjust. Do not commit terraform.tfvars.
+#
+# Prerequisites:
+#   - AWS account + credentials (e.g. export AWS_PROFILE=... or access keys)
+#   - AWS CLI v2 on PATH (`aws eks get-token` is used by Terraform's Kubernetes provider)
+#   - IAM permissions for VPC, EKS, EC2, IAM (OIDC provider + roles), etc.
+#   - Expect NAT gateway + EC2 node charges while the cluster runs (lab stack).
+#
+# EKS-rbac.sh Check 2 reads kube-system/aws-auth. Many EKS clusters still ship this
+# ConfigMap for node auth; clusters that rely only on EKS access entries may not
+# have it — the script reports that case explicitly.
+
+# aws_region   = "us-west-2"
+# cluster_name = "kube-fluff-eks-test"
+
+# deploy_capability_test_workloads = true
+# deploy_rbac_test_fixtures        = true
+# deploy_irsa_demo                 = true
