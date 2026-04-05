@@ -6,7 +6,7 @@ START_TIME_NS=$(date +%s%N)
 ##########################################################################
 # KUBERNETES RBAC AUDIT SCRIPT — ARCHITECTURE, SEMANTICS & USAGE GUIDE
 #
-# This script performs a deep RBAC audit on Kubernetes/GKE clusters.
+# This script performs a deep RBAC audit on Kubernetes/AKS clusters.
 # The logic is optimized, safe, and explicit about what Kubernetes RBAC
 # *can* and *cannot* do. Please read this section carefully before making
 # modifications or interpreting results.
@@ -118,7 +118,7 @@ START_TIME_NS=$(date +%s%N)
 # 6. ALLOWLIST BEHAVIOR FOR CONTROLLERS (QUIET MODE)
 # ========================================================================
 #
-# Some components (ArgoCD, Istio, Kyverno, Cilium, GCP/GKE controllers, etc.)
+# Some components (ArgoCD, Istio, Kyverno, Cilium, Azure/AKS controllers, etc.)
 # MUST read secrets, CRDs, webhooks, endpoints, etc. These appear noisy but
 # are expected. Patterns are defined in ALLOWLIST_ROLES.
 #
@@ -163,7 +163,7 @@ START_TIME_NS=$(date +%s%N)
 # HIGH-VALUE CHECKS:
 # ------------------
 #   1  → system:masters exposures in RBAC
-#   2  → Optional GCP IAM slice from gcloud get-iam-policy on the cluster resource (not full GCP admin map)
+#   2  → Optional Azure RBAC slice from az for the cluster ARM scope (not full Azure admin picture)
 #   4  → Non-system users with cluster-admin
 #   6  → pod exec
 #   9  → secrets read (get/list/watch)
@@ -171,24 +171,24 @@ START_TIME_NS=$(date +%s%N)
 #   18 → sensitive pod subresources + endpoints
 #   19 → CRD-based secret/credential exposure  (MOST IMPORTANT)
 #   20 → privileged serviceaccount bindings
-#   22 → Workload Identity SAs (in-cluster) with risky RBAC
+#   22 → Azure Workload Identity SAs (client-id annotation) with risky RBAC (in-cluster only)
 #
-# GKE defaults: ClusterRoleBindings matching is_gke_managed_clusterrolebinding_name() are skipped in
-# checks 20–21 (not 22). Set GKE_INCLUDE_MANAGED_DEFAULT_BINDINGS=1 to disable that skip.
+# AKS defaults: ClusterRoleBindings matching is_aks_managed_clusterrolebinding_name() are skipped in
+# checks 20–21 (not 22). Set AKS_INCLUDE_MANAGED_DEFAULT_BINDINGS=1 to disable that skip.
 #
 #
 # USE MODES:
 # ----------
-# ./GKE-rbac.sh
+# ./AKS-rbac.sh
 #       → Full audit
 #
-# ./GKE-rbac.sh --quiet
+# ./AKS-rbac.sh --quiet
 #       → Only actionable findings (hides system/operator roles)
 #
-# ./GKE-rbac.sh --checks=19
+# ./AKS-rbac.sh --checks=19
 #       → CRD exposure audit only
 #
-# ./GKE-rbac.sh --critical
+# ./AKS-rbac.sh --critical
 #       → Only high-severity checks
 #
 #
@@ -198,12 +198,13 @@ START_TIME_NS=$(date +%s%N)
 # • “from:” shows WHERE bindings were found, not privilege flow.
 # • A role with no subjects is ignored — it exposes nothing.
 # • Allowlisted roles are expected controller noise.
-# • GKE check 2 (optional): gcloud on PATH + GKE_PROJECT, GKE_CLUSTER_NAME, GKE_LOCATION
-#   (region or zone). Lists bindings returned by get-iam-policy on the **cluster resource** for
-#   roles/container.clusterAdmin and container.admin only—not every path to cluster admin (e.g. project/folder/org
-#   roles, Owner/Editor, other roles). Does not replace IAM Recommender or org policy review.
-# • GKE checks 20–21 skip curated GKE ClusterRoleBinding names unless
-#   GKE_INCLUDE_MANAGED_DEFAULT_BINDINGS=1. Check 22 flags WI-annotated SAs with risky RBAC.
+# • AKS check 2 (optional): az on PATH + AKS_RESOURCE_GROUP, AKS_CLUSTER_NAME; optional
+#   AKS_SUBSCRIPTION_ID (else active subscription from `az account show`). Lists flagged Azure roles
+#   returned for the managed cluster ARM scope (and descendant scopes per `az role assignment list --all`
+#   for your CLI version)—not a full map of “who can admin the cluster in Azure” (e.g. RG/subscription
+#   assignments may not appear). Does not replace Azure Policy / Entra reviews.
+# • AKS checks 20–21 skip curated AKS ClusterRoleBinding names unless
+#   AKS_INCLUDE_MANAGED_DEFAULT_BINDINGS=1. Check 22 flags Azure WI-annotated SAs with risky RBAC.
 #
 #
 # ========================================================================
@@ -246,10 +247,10 @@ START_TIME_NS=$(date +%s%N)
 #
 # 5) DEBUGGING TIPS
 # -----------------
-# • bash -n GKE-rbac.sh
+# • bash -n AKS-rbac.sh
 #       Validate syntax.
 #
-# • K=/path/to/kubectl ./GKE-rbac.sh
+# • K=/path/to/kubectl ./AKS-rbac.sh
 #       Use a different kubectl binary.
 #
 # • DEBUG_CHECK20=1 / DEBUG_CHECK21=1 (or --debug-check20 / --debug-check21):
@@ -261,7 +262,7 @@ START_TIME_NS=$(date +%s%N)
 set -e
 set -o pipefail
 
-# Allow overriding kubectl via env: K=/path/to/kubectl ./GKE-rbac.sh
+# Allow overriding kubectl via env: K=/path/to/kubectl ./AKS-rbac.sh
 K="${K:-kubectl}"
 
 # ------------------------------------------------------------
@@ -327,11 +328,11 @@ done
 # If --help/-h was passed, print usage text and exit immediately
 if [[ ${SHOW_HELP:-0} -eq 1 ]]; then
   cat <<'EOF'
-Kubernetes/GKE RBAC Security Audit
+Kubernetes/AKS RBAC Security Audit
 ----------------------------------
 
 Usage:
-  GKE-rbac.sh [--checks LIST] [--critical] [--quiet] [--debug-check20] [--debug-check21]
+  AKS-rbac.sh [--checks LIST] [--critical] [--quiet] [--debug-check20] [--debug-check21]
                 [--help | -h]
 
 Flags:
@@ -344,20 +345,20 @@ Flags:
   -h, --help         Show this help and exit.
 
 Examples:
-  GKE-rbac.sh --quiet
-  GKE-rbac.sh --checks=19
-  GKE-rbac.sh --checks=1,2,4-6 --quiet
+  AKS-rbac.sh --quiet
+  AKS-rbac.sh --checks=19
+  AKS-rbac.sh --checks=1,2,4-6 --quiet
 
 Description:
-  This script performs a comprehensive RBAC audit of a Kubernetes/GKE
+  This script performs a comprehensive RBAC audit of a Kubernetes/AKS
   cluster, including secret/credential CRD exposure, wildcard detection,
   pod exec & sensitive subresources, token minting, cluster-admin misuse,
-  Check 2 is optional: it lists clusterAdmin/container.admin members on the cluster resource via
-  gcloud get-iam-policy—not a full map of GCP access to the cluster (parent-scope roles may be missing).
-  Needs gcloud and GKE_PROJECT, GKE_CLUSTER_NAME, GKE_LOCATION (see output when prerequisites are missing).
-  Check 22 flags WI-annotated SAs that also
-  have risky RBAC. GKE-managed ClusterRoleBindings are skipped in checks 20–21
-  unless GKE_INCLUDE_MANAGED_DEFAULT_BINDINGS=1. See header comments.
+  Check 2 is optional: it lists high-privilege Azure role assignments that az returns for the managed
+  cluster resource (not every Azure path to cluster admin; RG/subscription grants may be missing).
+  Needs az and AKS_RESOURCE_GROUP, AKS_CLUSTER_NAME (optional AKS_SUBSCRIPTION_ID; see output
+  when check 2 runs without them). Check 22 flags Azure WI-annotated SAs that also
+  have risky RBAC. AKS-managed ClusterRoleBindings are skipped in checks 20–21
+  unless AKS_INCLUDE_MANAGED_DEFAULT_BINDINGS=1. See header comments.
 EOF
   exit 0
 fi
@@ -423,7 +424,7 @@ if [[ $LIST_CHECKS -eq 1 ]]; then
   cat <<'EOF'
 Available checks (use --checks to select, comma-separated, ranges allowed):
   1  : RBAC bindings referencing system:masters (ClusterRoleBindings/RoleBindings)
-  2  : Optional GCP IAM — clusterAdmin & container.admin on cluster resource via gcloud (needs gcloud + env; not full GCP map)
+  2  : Optional Azure RBAC — flagged roles az lists on the cluster ARM scope only (needs az + env; not full Azure admin map)
   3  : System groups do NOT have cluster-admin
   4  : No non-system subjects have cluster-admin
   5  : No custom subjects can create workload resources (pods/deployments/statefulsets)
@@ -443,13 +444,13 @@ Available checks (use --checks to select, comma-separated, ranges allowed):
   19 : CRD-based secret/credential exposure (heuristic) + RBAC read grants
   20 : Default SA & system:serviceaccounts bindings to privileged roles (with informational output)
   21 : Workloads using risky ServiceAccounts via RBAC, with backpointers
-  22 : Workload Identity SAs (iam.gke.io/gcp-service-account) with risky RBAC (in-cluster only)
+  22 : Azure Workload Identity SAs (azure.workload.identity/client-id) with risky RBAC (in-cluster only)
 EOF
   exit 0
 fi
 
 # Print audit banner: cluster context, active user, selected checks, quiet mode, and output legend
-echo "===== Kubernetes/GKE RBAC Security Audit ====="
+echo "===== Kubernetes/AKS RBAC Security Audit ====="
 echo "Context: $($K config current-context 2>/dev/null || echo unknown)"
 echo "User: $($K config view --minify -o jsonpath='{.users[0].name}' 2>/dev/null || echo unknown)"
 if [[ $RUN_ALL -eq 0 ]]; then
@@ -475,17 +476,20 @@ EXCLUDED_NS=(
   "kube-public"
   "kube-node-lease"
   "gmp-system"
-  "gke-managed-system"
-  "gke-managed-volumepopulator"
+  "calico-system"
+  "tigera-operator"
   "config-management-system"
-  "gke-mcs-*"
-  "gke-fleet-*"
+  "kube-lineage"
+  "azure-arc"
+  "app-routing-system"
+  "ingress-appgw"
+  "aks-command"
   "external-dns"
   "metrics-server"
   "cluster-autoscaler"
 )
 
-# Add operator-managed namespaces dynamically (no-op on GKE unless OLM installed)
+# Add operator-managed namespaces dynamically (no-op on AKS unless OLM installed)
 while IFS= read -r _op_ns; do
   [[ -n "$_op_ns" ]] && EXCLUDED_NS+=("$_op_ns")
 done < <(
@@ -535,6 +539,7 @@ system:node,system:node-proxier,system:kube-controller-manager,system:kube-sched
 system:cloud-controller-manager,system:certificates.kubelet-serving,kube-proxy,\
 system:controller:glbc,system:controller:horizontal-pod-autoscaler,\
 gke-gmp-*,gke-metrics-agent,gke-metadata-server-reader,gke-common-webhooks,\
+omsagent*,azure-cloud-node-manager*,aks-*,tigera-*,calico-*,csi-secrets-store*,ingress-appgw*,\
 cluster-autoscaler,l7-lb-controller-*,ingress-gce*,gce:podsecuritypolicy:calico-sa,\
 gmp-*,
 cilium,cilium-*,cilium-operator,hubble-ui,hubble-relay,\
@@ -547,7 +552,7 @@ external-secrets,external-secrets-controller,external-secrets-cert-controller,\
 datadog,datadog-*,datadog-cluster-agent,datadog-ksm-core,\
 trivy-operator,trivy-adapter,\
 reloader-*,reloader-0-eks-reloader-role,reloader-0-gke-reloader-role,\
-k8sensor,instana-*,policy-reporter-*,coredns-eks-coredns,coredns-gke-coredns,coredns*,nginx-gateway-internal"
+k8sensor,instana-*,policy-reporter-*,coredns-eks-coredns,coredns-gke-coredns,coredns-aks-coredns,coredns*,nginx-gateway-internal"
 
 is_allowlisted_role() {
   local name="$1"
@@ -562,15 +567,15 @@ is_allowlisted_role() {
   return 1
 }
 
-# Curated GKE-first-party ClusterRoleBinding names (noise in checks 20–21). Globs via bash case.
-# Set GKE_INCLUDE_MANAGED_DEFAULT_BINDINGS=1 to treat them like any other binding.
-is_gke_managed_clusterrolebinding_name() {
-  [[ "${GKE_INCLUDE_MANAGED_DEFAULT_BINDINGS:-0}" == "1" ]] && return 1
+# Curated AKS-first-party ClusterRoleBinding names (noise in checks 20–21). Globs via bash case.
+# Set AKS_INCLUDE_MANAGED_DEFAULT_BINDINGS=1 to treat them like any other binding.
+is_aks_managed_clusterrolebinding_name() {
+  [[ "${AKS_INCLUDE_MANAGED_DEFAULT_BINDINGS:-0}" == "1" ]] && return 1
   local n="$1"
   case "$n" in
-    event-exporter*|gke-common-*|gke-managed-*|gmp-*|gke-gmp-*|gke-metadata-server*|gke-metrics-agent*|gke-mcs-*|gke-fleet-*)
+    omsagent*|container-health-*|tigera-*|calico-*|aks-*|azure-*|metrics-server-aks*|csi-*|ingress-appgw*|cloud-node-manager*|gatekeeper-admin|event-exporter*)
       return 0 ;;
-    system:gke-*|system:controller:glbc|system:controller:horizontal-pod-autoscaler)
+    system:controller:horizontal-pod-autoscaler|system:cloud-controller-manager)
       return 0 ;;
   esac
   return 1
@@ -770,58 +775,71 @@ if should_run 1; then
   echo
 fi
 
-# Check 2: Optional GCP IAM bindings on the GKE cluster resource only (analogue to EKS aws-auth / AKS Azure RBAC slice).
-# get-iam-policy on the cluster does not include every admin path (project/folder/org; other role types).
-# Requires: gcloud on PATH, GKE_PROJECT, GKE_CLUSTER_NAME, GKE_LOCATION (region or zone).
+# Check 2: Optional Azure RBAC slice for the managed cluster resource (analogue to EKS aws-auth / GKE cluster IAM).
+# Not exhaustive for Azure admin paths: parent RG/subscription roles may be omitted; --all follows Azure CLI semantics.
+# Requires: az on PATH, AKS_RESOURCE_GROUP, AKS_CLUSTER_NAME; optional AKS_SUBSCRIPTION_ID (else active subscription from az account show).
 if should_run 2; then
-  echo "2: GCP cluster IAM (optional — high-privilege bindings on the cluster resource)"
+  echo "2: Azure RBAC on cluster resource (optional — high-privilege role assignments)"
 
-  if command -v gcloud >/dev/null 2>&1 \
-     && [[ -n "${GKE_PROJECT:-}" ]] && [[ -n "${GKE_CLUSTER_NAME:-}" ]] && [[ -n "${GKE_LOCATION:-}" ]]; then
-    if [[ $QUIET -eq 0 ]]; then
-      echo " (Check 2 scope: gcloud get-iam-policy on this cluster resource only; not full GCP admin picture—see script header.)"
+  if command -v az >/dev/null 2>&1 \
+     && [[ -n "${AKS_RESOURCE_GROUP:-}" ]] && [[ -n "${AKS_CLUSTER_NAME:-}" ]]; then
+    sub_id="${AKS_SUBSCRIPTION_ID:-}"
+    if [[ -z "$sub_id" ]]; then
+      sub_id=$(az account show -o tsv --query id 2>/dev/null || true)
     fi
-    pol=""
-    if pol=$(gcloud container clusters get-iam-policy "$GKE_CLUSTER_NAME" \
-        --project="$GKE_PROJECT" --region="$GKE_LOCATION" --format=json 2>/dev/null); then
-      :
-    elif pol=$(gcloud container clusters get-iam-policy "$GKE_CLUSTER_NAME" \
-        --project="$GKE_PROJECT" --zone="$GKE_LOCATION" --format=json 2>/dev/null); then
-      :
-    else
-      pol=""
-    fi
-    if [[ -z "$pol" ]]; then
+    if [[ -z "$sub_id" ]]; then
       if [[ $QUIET -eq 0 ]]; then
-        echo " ⚠ Could not read cluster IAM policy via gcloud."
-        echo "   Verify: GKE_LOCATION matches a regional cluster (--region) or zonal cluster (--zone),"
-        echo "   gcloud auth applies, and your principal has permission container.clusters.getIamPolicy."
+        echo " ⚠ Could not determine Azure subscription id (set AKS_SUBSCRIPTION_ID or run az login / az account set)."
       fi
     else
-      iam_out=$(echo "$pol" | jq -r '
-        .bindings[]?
-        | select(.role == "roles/container.clusterAdmin" or .role == "roles/container.admin")
-        | .role as $r
-        | (.members // [])[]
-        | " • GCP IAM \($r) -> \(.)"
-      ' 2>/dev/null || true)
-      if [[ -n "$iam_out" ]]; then
-        echo " GCP cluster IAM bindings (review for least privilege):"
-        printf '%s\n' "$iam_out"
-      elif [[ $QUIET -eq 0 ]]; then
-        echo " ✔ No roles/container.clusterAdmin or roles/container.admin bindings on this cluster resource."
+      scope="/subscriptions/${sub_id}/resourceGroups/${AKS_RESOURCE_GROUP}/providers/Microsoft.ContainerService/managedClusters/${AKS_CLUSTER_NAME}"
+      if [[ $QUIET -eq 0 ]]; then
+        echo " (Check 2 scope: assignments az returns for this cluster resource; not all Azure paths to cluster admin—see script header.)"
+      fi
+      ra_json=""
+      if ! ra_json=$(az role assignment list --scope "$scope" --all -o json 2>/dev/null); then
+        ra_json=""
+      fi
+      if [[ -z "$ra_json" ]]; then
+        if [[ $QUIET -eq 0 ]]; then
+          echo " ⚠ Could not list Azure role assignments at cluster scope (az role assignment list failed)."
+          echo "   Verify: az login, AKS_RESOURCE_GROUP / AKS_CLUSTER_NAME, and Reader or similar on the cluster resource."
+        fi
+      else
+        iam_out=$(echo "$ra_json" | jq -r '
+          .[]?
+          | (.roleDefinitionName // .properties.roleDefinitionName) as $r
+          | (.principalName // .properties.principalName) as $pn
+          | (.principalId // .properties.principalId) as $pid
+          | (.principalType // .properties.principalType) as $pt
+          | select(
+              $r == "Owner"
+              or $r == "Contributor"
+              or $r == "Azure Kubernetes Service Cluster Admin Role"
+              or $r == "Azure Kubernetes Service RBAC Cluster Admin"
+              or $r == "Azure Kubernetes Service Contributor Role"
+              or $r == "Azure Kubernetes Service RBAC Admin"
+            )
+          | " • Azure RBAC \($r) -> \($pn // $pid) (\($pt // "unknown"))"
+        ' 2>/dev/null || true)
+        if [[ -n "$iam_out" ]]; then
+          echo " Azure role assignments on managed cluster (review for least privilege):"
+          printf '%s\n' "$iam_out"
+        elif [[ $QUIET -eq 0 ]]; then
+          echo " ✔ No flagged Owner, Contributor, or AKS admin Azure roles at this cluster scope."
+        fi
       fi
     fi
   elif [[ $QUIET -eq 0 ]]; then
-    echo " Check 2 not run (optional): prerequisites for GCP cluster IAM audit:"
-    echo "   • gcloud installed and on PATH, with an account that can call get-iam-policy on the cluster"
-    echo "   • GKE_PROJECT        — GCP project ID (e.g. my-gcp-project)"
-    echo "   • GKE_CLUSTER_NAME   — Cluster name as shown by: gcloud container clusters list"
-    echo "   • GKE_LOCATION       — Region (e.g. us-central1) for regional clusters, or zone (e.g. us-central1-a) for zonal"
-    echo "   • jq                 — required to parse policy JSON (same as rest of this script)"
-    echo " When run: only bindings returned for the cluster resource (parent IAM may grant access without appearing here)."
+    echo " Check 2 not run (optional): prerequisites for Azure RBAC audit on the cluster resource:"
+    echo "   • Azure CLI (az) on PATH, authenticated (az login or service principal env vars)"
+    echo "   • AKS_RESOURCE_GROUP — resource group containing the cluster"
+    echo "   • AKS_CLUSTER_NAME   — cluster name as shown by: az aks list -o table"
+    echo "   • AKS_SUBSCRIPTION_ID — optional; defaults to active subscription from az account show"
+    echo "   • jq                 — required to parse JSON (same as rest of this script)"
+    echo " When run: lists only what az surfaces for the managed cluster scope (not full Azure admin picture)."
     echo " Example:"
-    echo "   GKE_PROJECT=my-proj GKE_CLUSTER_NAME=my-cluster GKE_LOCATION=us-central1 $0 --checks=2"
+    echo "   AKS_RESOURCE_GROUP=my-rg AKS_CLUSTER_NAME=my-aks $0 --checks=2"
   fi
   echo
 fi
@@ -1628,8 +1646,8 @@ if should_run 20; then
 
       [[ $CHECK20_SHOW_PROGRESS -eq 1 ]] && echo -n "."
 
-      if is_gke_managed_clusterrolebinding_name "$name"; then
-        check20_debug "skip ClusterRoleBinding (GKE managed default): $name"
+      if is_aks_managed_clusterrolebinding_name "$name"; then
+        check20_debug "skip ClusterRoleBinding (AKS managed default): $name"
         continue
       fi
 
@@ -1885,8 +1903,8 @@ if should_run 21; then
       local ns="" bname refKind refName subjects_str
       if [[ "$scope" == "cluster" ]]; then
         bname="$a"
-        if is_gke_managed_clusterrolebinding_name "$bname"; then
-          check21_debug "skip ClusterRoleBinding (GKE managed default): $bname"
+        if is_aks_managed_clusterrolebinding_name "$bname"; then
+          check21_debug "skip ClusterRoleBinding (AKS managed default): $bname"
           continue
         fi
         refKind="$b"
@@ -2095,10 +2113,10 @@ if should_run 21; then
   echo
 fi
 
-# Check 22: ServiceAccounts with Workload Identity (GKE) annotations that are also bound to risky
-# roles (same categories as check 21). Does not evaluate IAM on the Google service account.
+# Check 22: ServiceAccounts with Azure Workload Identity annotations that are also bound to risky
+# roles (same categories as check 21). Does not evaluate Azure RBAC on the federated identity / app registration.
 if should_run 22; then
-  echo "22: Workload Identity ServiceAccounts with risky RBAC (in-cluster only)"
+  echo "22: Azure Workload Identity ServiceAccounts with risky RBAC (in-cluster only)"
 
   c22_merge_csv() { (echo "$1"; echo "$2") | tr ',' '\n' | awk 'NF' | sort -u | paste -sd',' -; }
   c22_merge_list() {
@@ -2182,25 +2200,25 @@ if should_run 22; then
     (IFS=,; echo "${parts[*]}")
   }
 
-  declare -A C22_WI_GCP
-  while IFS=$'\t' read -r _ns _sa _gcp; do
+  declare -A C22_WI_AZURE
+  while IFS=$'\t' read -r _ns _sa _cid; do
     [[ -z "${_ns:-}" || -z "${_sa:-}" ]] && continue
-    C22_WI_GCP["${_ns}|${_sa}"]="$_gcp"
+    C22_WI_AZURE["${_ns}|${_sa}"]="$_cid"
   done < <(
     $K get sa -A -o json 2>/dev/null \
     | jq -r '
         (.items // [])[]
-        | ( .metadata.annotations["iam.gke.io/gcp-service-account"]
-            // .metadata.annotations["alpha.iam.gke.io/gcp-service-account"]
-            // "" ) as $gcp
-        | select($gcp != "")
-        | [ .metadata.namespace, .metadata.name, $gcp ] | @tsv
+        | ( .metadata.annotations["azure.workload.identity/client-id"]
+            // .metadata.annotations["azure.workload.identity/service-account-client-id"]
+            // "" ) as $cid
+        | select($cid != "")
+        | [ .metadata.namespace, .metadata.name, $cid ] | @tsv
       ' 2>/dev/null || true
   )
 
-  if [[ ${#C22_WI_GCP[@]} -eq 0 ]]; then
+  if [[ ${#C22_WI_AZURE[@]} -eq 0 ]]; then
     if [[ $QUIET -eq 0 ]]; then
-      echo " ✔ No ServiceAccounts with Workload Identity annotation (iam.gke.io/gcp-service-account)"
+      echo " ✔ No ServiceAccounts with Azure Workload Identity annotation (azure.workload.identity/client-id)"
     fi
     echo
     # Skip binding scan
@@ -2215,7 +2233,7 @@ if should_run 22; then
         [[ "$sns" == "-" ]] && continue
         is_excluded_ns "$sns" && continue
         key="${sns}|${sname}"
-        [[ -z "${C22_WI_GCP[$key]:-}" ]] && continue
+        [[ -z "${C22_WI_AZURE[$key]:-}" ]] && continue
         C22_SA_RISK["$key"]="$(c22_merge_csv "${C22_SA_RISK[$key]:-}" "$risk_csv")"
         bp="ClusterRoleBinding=$bname → $refKind/$refName"
         C22_SA_BP["$key"]="$(c22_merge_list "${C22_SA_BP[$key]:-}" "$bp")"
@@ -2232,7 +2250,7 @@ if should_run 22; then
         [[ "$sns" == "-" ]] && continue
         is_excluded_ns "$sns" && continue
         key="${sns}|${sname}"
-        [[ -z "${C22_WI_GCP[$key]:-}" ]] && continue
+        [[ -z "${C22_WI_AZURE[$key]:-}" ]] && continue
         C22_SA_RISK["$key"]="$(c22_merge_csv "${C22_SA_RISK[$key]:-}" "$risk_csv")"
         bp="RoleBinding=$bname (ns=$ns) → $refKind/$refName"
         C22_SA_BP["$key"]="$(c22_merge_list "${C22_SA_BP[$key]:-}" "$bp")"
@@ -2245,12 +2263,12 @@ if should_run 22; then
       found_c22=1
       ns="${key%%|*}"
       sa="${key#*|}"
-      echo " ⚠ WI SA $ns/$sa → GCP ${C22_WI_GCP[$key]} — RBAC risk: ${C22_SA_RISK[$key]}"
+      echo " ⚠ Azure WI SA $ns/$sa → client-id ${C22_WI_AZURE[$key]} — RBAC risk: ${C22_SA_RISK[$key]}"
       echo "        ↳ ${C22_SA_BP[$key]}"
     done < <(printf '%s\n' "${!C22_SA_RISK[@]}" | sort)
     if [[ $found_c22 -eq 0 ]]; then
       if [[ $QUIET -eq 0 ]]; then
-        echo " ✔ No WI-annotated ServiceAccount has risky RBAC bindings (among checked categories)"
+        echo " ✔ No Azure WI-annotated ServiceAccount has risky RBAC bindings (among checked categories)"
       fi
     fi
     echo

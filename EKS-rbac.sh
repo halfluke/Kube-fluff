@@ -163,7 +163,7 @@ START_TIME_NS=$(date +%s%N)
 # HIGH-VALUE CHECKS:
 # ------------------
 #   1  → system:masters exposures in RBAC
-#   2  → EKS aws-auth misconfigurations
+#   2  → EKS aws-auth ConfigMap (mapRoles/mapUsers → system:masters); not all AWS/EKS access paths
 #   4  → Non-system users with cluster-admin
 #   6  → pod exec
 #   9  → secrets read (get/list/watch)
@@ -175,16 +175,16 @@ START_TIME_NS=$(date +%s%N)
 #
 # USE MODES:
 # ----------
-# ./rbac-audit.sh
+# ./EKS-rbac.sh
 #       → Full audit
 #
-# ./rbac-audit.sh --quiet
+# ./EKS-rbac.sh --quiet
 #       → Only actionable findings (hides system/operator roles)
 #
-# ./rbac-audit.sh --checks=19
+# ./EKS-rbac.sh --checks=19
 #       → CRD exposure audit only
 #
-# ./rbac-audit.sh --critical
+# ./EKS-rbac.sh --critical
 #       → Only high-severity checks
 #
 #
@@ -194,6 +194,8 @@ START_TIME_NS=$(date +%s%N)
 # • “from:” shows WHERE bindings were found, not privilege flow.
 # • A role with no subjects is ignored — it exposes nothing.
 # • Allowlisted roles are expected controller noise.
+# • EKS check 2 reads kube-system/aws-auth only for entries mapping to system:masters. It does not cover
+#   every path to cluster admin (e.g. EKS access APIs / AccessEntry, IRSA, node/instance roles, broader IAM).
 #
 #
 # ========================================================================
@@ -236,10 +238,10 @@ START_TIME_NS=$(date +%s%N)
 #
 # 5) DEBUGGING TIPS
 # -----------------
-# • bash -n rbac-audit.sh
+# • bash -n EKS-rbac.sh
 #       Validate syntax.
 #
-# • K=/path/to/kubectl ./rbac-audit.sh
+# • K=/path/to/kubectl ./EKS-rbac.sh
 #       Use a different kubectl binary.
 #
 # • DEBUG_CHECK20=1 / DEBUG_CHECK21=1 (or --debug-check20 / --debug-check21):
@@ -247,10 +249,11 @@ START_TIME_NS=$(date +%s%N)
 #
 ##########################################################################
 
-# Exit immediately on any unhandled error; allow kubectl binary override via env var K=
+# Exit immediately on any unhandled error; propagate failures through pipelines (kubectl | jq | …).
 set -e
+set -o pipefail
 
-# Allow overriding kubectl via env: K=/path/to/kubectl ./rbac-audit-eks.sh
+# Allow overriding kubectl via env: K=/path/to/kubectl ./EKS-rbac.sh
 K="${K:-kubectl}"
 
 # ------------------------------------------------------------
@@ -320,7 +323,7 @@ Kubernetes/EKS RBAC Security Audit
 ----------------------------------
 
 Usage:
-  rbac-audit.sh [--checks LIST] [--critical] [--quiet] [--debug-check20] [--debug-check21]
+  EKS-rbac.sh [--checks LIST] [--critical] [--quiet] [--debug-check20] [--debug-check21]
                 [--help | -h]
 
 Flags:
@@ -333,15 +336,16 @@ Flags:
   -h, --help         Show this help and exit.
 
 Examples:
-  rbac-audit.sh --quiet
-  rbac-audit.sh --checks=19
-  rbac-audit.sh --checks=1,2,4-6 --quiet
+  EKS-rbac.sh --quiet
+  EKS-rbac.sh --checks=19
+  EKS-rbac.sh --checks=1,2,4-6 --quiet
 
 Description:
   This script performs a comprehensive RBAC audit of a Kubernetes/EKS
   cluster, including secret/credential CRD exposure, wildcard detection,
   pod exec & sensitive subresources, token minting, cluster-admin misuse,
-  and more. See header comments for full details on semantics.
+  and more. Check 2 scans aws-auth mapRoles/mapUsers for system:masters only—not a full AWS/EKS access audit.
+  See header comments for full details on semantics.
 EOF
   exit 0
 fi
@@ -407,7 +411,7 @@ if [[ $LIST_CHECKS -eq 1 ]]; then
   cat <<'EOF'
 Available checks (use --checks to select, comma-separated, ranges allowed):
   1  : RBAC bindings referencing system:masters (ClusterRoleBindings/RoleBindings)
-  2  : EKS aws-auth mappings that grant system:masters
+  2  : EKS aws-auth mapRoles/mapUsers → system:masters only (not full AWS/EKS admin paths)
   3  : System groups do NOT have cluster-admin
   4  : No non-system subjects have cluster-admin
   5  : No custom subjects can create workload resources (pods/deployments/statefulsets)
@@ -732,10 +736,13 @@ if should_run 1; then
   echo
 fi
 
-# Check 2: Scan the EKS aws-auth ConfigMap for IAM role/user mappings that grant system:masters,
-# which would give full cluster-admin access outside of RBAC.
+# Check 2: Scan aws-auth ConfigMap (mapRoles / mapUsers) for mappings to system:masters (cluster-admin via IAM bridge).
+# Does not enumerate all EKS/AWS paths to admin (AccessEntry, IRSA, node roles, etc.).
 if should_run 2; then
   echo "2: EKS aws-auth mappings that grant system:masters"
+  if [[ $QUIET -eq 0 ]]; then
+    echo " (Check 2 scope: kube-system/aws-auth mapRoles/mapUsers only; not full AWS/EKS access picture—see script header.)"
+  fi
   if $K -n kube-system get configmap aws-auth >/dev/null 2>&1; then
     out=$(
       $K -n kube-system get configmap aws-auth -o json \
@@ -1473,8 +1480,12 @@ if should_run 20; then
     CHECK20_SHOW_PROGRESS=0
   fi
 
+  # Always return 0: under pipefail this can be the last command in a `| while read` iteration (e.g. --quiet).
   check20_debug() {
-    [[ "${DEBUG_CHECK20:-0}" -eq 1 ]] && printf '[debug check20] %s\n' "$*" >&2
+    if [[ "${DEBUG_CHECK20:-0}" -eq 1 ]]; then
+      printf '[debug check20] %s\n' "$*" >&2
+    fi
+    return 0
   }
   [[ "${DEBUG_CHECK20:-0}" -eq 1 ]] && check20_debug "debug enabled (messages on stderr)"
 
@@ -1517,8 +1528,8 @@ if should_run 20; then
 
   # Build fast lookup caches
   declare -A PRIV_CR PRIV_R
-  while IFS= read -r _n; do [[ -n "$_n" ]] && PRIV_CR["$_n"]=1; done <<<"$PRIV_CR_NAMES"
-  while IFS= read -r _k; do [[ -n "$_k" ]] && PRIV_R["$_k"]=1; done <<<"$PRIV_R_NS_NAMES"
+  while IFS= read -r _n; do if [[ -n "$_n" ]]; then PRIV_CR["$_n"]=1; fi; done <<<"$PRIV_CR_NAMES"
+  while IFS= read -r _k; do if [[ -n "$_k" ]]; then PRIV_R["$_k"]=1; fi; done <<<"$PRIV_R_NS_NAMES"
 
   if [[ "${DEBUG_CHECK20:-0}" -eq 1 ]]; then
     _c20_cr=$(printf '%s\n' "$PRIV_CR_NAMES" | grep -c . || true)
@@ -1709,7 +1720,10 @@ if should_run 21; then
   EXPOSE_FOUND=0
 
   check21_debug() {
-    [[ "${DEBUG_CHECK21:-0}" -eq 1 ]] && printf '[debug check21] %s\n' "$*" >&2
+    if [[ "${DEBUG_CHECK21:-0}" -eq 1 ]]; then
+      printf '[debug check21] %s\n' "$*" >&2
+    fi
+    return 0
   }
   [[ "${DEBUG_CHECK21:-0}" -eq 1 ]] && check21_debug "debug enabled (messages on stderr)"
 
@@ -1768,14 +1782,14 @@ if should_run 21; then
   TOK_R_NS_NAMES=$(compute_risky_roles        "$TOKEN_PREDICATE")
 
   declare -A CR_PRIV CR_SEC CR_POD CR_TOK R_PRIV R_SEC R_POD R_TOK
-  while IFS= read -r n;  do [[ -n "$n"  ]] && CR_PRIV["$n"]=1; done <<<"$PRIV_CR_NAMES"
-  while IFS= read -r n;  do [[ -n "$n"  ]] && CR_SEC["$n"]=1;  done <<<"$SEC_CR_NAMES"
-  while IFS= read -r n;  do [[ -n "$n"  ]] && CR_POD["$n"]=1;  done <<<"$POD_CR_NAMES"
-  while IFS= read -r n;  do [[ -n "$n"  ]] && CR_TOK["$n"]=1;  done <<<"$TOK_CR_NAMES"
-  while IFS= read -r nk; do [[ -n "$nk" ]] && R_PRIV["$nk"]=1; done <<<"$PRIV_R_NS_NAMES"
-  while IFS= read -r nk; do [[ -n "$nk" ]] && R_SEC["$nk"]=1;  done <<<"$SEC_R_NS_NAMES"
-  while IFS= read -r nk; do [[ -n "$nk" ]] && R_POD["$nk"]=1;  done <<<"$POD_R_NS_NAMES"
-  while IFS= read -r nk; do [[ -n "$nk" ]] && R_TOK["$nk"]=1;  done <<<"$TOK_R_NS_NAMES"
+  while IFS= read -r n;  do if [[ -n "$n" ]]; then CR_PRIV["$n"]=1; fi; done <<<"$PRIV_CR_NAMES"
+  while IFS= read -r n;  do if [[ -n "$n" ]]; then CR_SEC["$n"]=1; fi; done <<<"$SEC_CR_NAMES"
+  while IFS= read -r n;  do if [[ -n "$n" ]]; then CR_POD["$n"]=1; fi; done <<<"$POD_CR_NAMES"
+  while IFS= read -r n;  do if [[ -n "$n" ]]; then CR_TOK["$n"]=1; fi; done <<<"$TOK_CR_NAMES"
+  while IFS= read -r nk; do if [[ -n "$nk" ]]; then R_PRIV["$nk"]=1; fi; done <<<"$PRIV_R_NS_NAMES"
+  while IFS= read -r nk; do if [[ -n "$nk" ]]; then R_SEC["$nk"]=1; fi; done <<<"$SEC_R_NS_NAMES"
+  while IFS= read -r nk; do if [[ -n "$nk" ]]; then R_POD["$nk"]=1; fi; done <<<"$POD_R_NS_NAMES"
+  while IFS= read -r nk; do if [[ -n "$nk" ]]; then R_TOK["$nk"]=1; fi; done <<<"$TOK_R_NS_NAMES"
 
   if [[ "${DEBUG_CHECK21:-0}" -eq 1 ]]; then
     check21_debug "risky role counts (CR / Role ns|name lines): priv=$(printf '%s\n' "$PRIV_CR_NAMES" | grep -c .)/$(printf '%s\n' "$PRIV_R_NS_NAMES" | grep -c .) sec=$(printf '%s\n' "$SEC_CR_NAMES" | grep -c .)/$(printf '%s\n' "$SEC_R_NS_NAMES" | grep -c .) pod=$(printf '%s\n' "$POD_CR_NAMES" | grep -c .)/$(printf '%s\n' "$POD_R_NS_NAMES" | grep -c .) tok=$(printf '%s\n' "$TOK_CR_NAMES" | grep -c .)/$(printf '%s\n' "$TOK_R_NS_NAMES" | grep -c .)"

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Amazon EKS: pod security audit (PSA labels + pod spec).
-# Uses kubectl and jq on PATH (same model as Vanilla-ContainerCapabilities.sh).
-# Extends --only-user-ns with common EKS platform namespaces; surfaces IRSA IAM role ARN (pod annotation, else ServiceAccount).
+# Same intent as Vanilla/GKE/AKS *ContainerCapabilities.sh: PSA + pod spec + cloud identity hint (IRSA ARN on pod or
+# ServiceAccount)—not AWS IAM review or admission-controller simulation.
+# Uses kubectl and jq on PATH. Extends --only-user-ns with common EKS platform namespaces.
 # "Effective caps (pod estimate)" is NOT admission-accurate — no PSA admission simulation.
 set -euo pipefail
 
@@ -60,6 +61,7 @@ if NODES_JSON=$(kubectl get nodes -o json 2>/dev/null); then
 fi
 
 echo "Running EKS security audit (PSA + pod-spec capabilities)..."
+echo "[INFO] Pod-spec + PSA labels only (not live admission); IRSA column is an in-cluster hint, not full AWS IAM."
 [[ "$ONLY_USER_NS" -eq 1 ]] && echo "Filtering: only non-system namespaces (not openshift-* / kube-* / aws-node)."
 echo ""
 

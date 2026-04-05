@@ -1,9 +1,8 @@
 #!/bin/bash
-# Google Kubernetes Engine (GKE): pod security audit (PSA labels + pod spec).
-# Same intent as Vanilla/EKS/AKS *ContainerCapabilities.sh: PSA + pod spec + GKE Workload Identity annotation hint—
-# not GCP IAM review or admission-controller simulation.
-# Uses kubectl and jq on PATH. Extends --only-user-ns with GKE-managed namespace patterns.
-# "Effective caps (pod estimate)" is NOT admission-accurate — no PSA admission simulation.
+# Azure Kubernetes Service (AKS): pod security audit (PSA labels + pod spec).
+# Same intent as Vanilla / EKS / GKE *ContainerCapabilities.sh: namespace PSA labels, declared pod spec,
+# and a cloud identity hint (here: Azure Workload Identity client-id on pod or ServiceAccount)—not Azure RBAC
+# or admission-controller simulation. "Effective caps (pod estimate)" is NOT admission-accurate.
 set -euo pipefail
 
 # -----------------------------
@@ -47,16 +46,16 @@ if ! NS_JSON=$(kubectl get ns -o json 2>/dev/null); then
     exit 1
 fi
 
-# Informational: Autopilot admission is stricter; this script only inspects pod desired state.
+# Informational: AKS-managed nodes typically carry kubernetes.azure.com/* labels.
 if NODES_JSON=$(kubectl get nodes -o json 2>/dev/null); then
-    if echo "$NODES_JSON" | jq -e '[.items[]?.metadata.labels["cloud.google.com/gke-provisioning"]?] | any(. == "autopilot")' >/dev/null 2>&1; then
-        echo "[INFO] Autopilot cluster detected (node label cloud.google.com/gke-provisioning=autopilot): admission may be stricter than this pod-spec-only estimate."
+    if echo "$NODES_JSON" | jq -e '[.items[]?.metadata.labels["kubernetes.azure.com/cluster"]?] | any(. != null and . != "")' >/dev/null 2>&1; then
+        echo "[INFO] AKS-style node labels detected (kubernetes.azure.com/cluster): cluster appears AKS-managed; admission may differ from this pod-spec-only estimate."
     fi
 fi
 
-echo "Running GKE security audit (PSA + pod-spec capabilities)..."
-echo "[INFO] Pod-spec + PSA labels only (not live admission); Workload Identity column is an in-cluster hint, not full GCP IAM."
-[[ "$ONLY_USER_NS" -eq 1 ]] && echo "Filtering: only non-system namespaces (not openshift-* / kube-* / gke-* / gmp-* / config-management-system / gatekeeper-system)."
+echo "Running AKS security audit (PSA + pod-spec capabilities)..."
+echo "[INFO] Pod-spec + PSA labels only (not live admission); Workload Identity column is an in-cluster hint, not full Azure IAM."
+[[ "$ONLY_USER_NS" -eq 1 ]] && echo "Filtering: only non-system namespaces (not openshift-* / kube-* / gmp-* / calico-* / tigera-* / aks-command / azure-arc* / app-routing-system / ingress-appgw / kube-lineage / config-management-system / gatekeeper-system)."
 echo ""
 
 # -----------------------------
@@ -99,7 +98,7 @@ get_psa_labels() {
     '
 }
 
-[[ "$OUTPUT_MODE" == "csv" ]] && echo "namespace,pod,serviceAccount,privileged_container,status,requested_caps_from_pod,dropped_caps_from_pod,effective_caps_pod_estimate,allowPrivilegeEscalation,hostPID,hostNetwork,hostIPC,runAsNonRoot,runAsUser,runAsGroup,fsGroup,supplementalGroups,volumeTypes,automountServiceAccountToken,workload_identity_gcp_service_account"
+[[ "$OUTPUT_MODE" == "csv" ]] && echo "namespace,pod,serviceAccount,privileged_container,status,requested_caps_from_pod,dropped_caps_from_pod,effective_caps_pod_estimate,allowPrivilegeEscalation,hostPID,hostNetwork,hostIPC,runAsNonRoot,runAsUser,runAsGroup,fsGroup,supplementalGroups,volumeTypes,automountServiceAccountToken,workload_identity_client_id"
 
 JSON_ITEMS=()
 
@@ -110,7 +109,10 @@ while read -r NS; do
 
     IS_SYSTEM_NS=0
     if [[ "$NS" == openshift-* ]] || [[ "$NS" == kube-* ]] \
-        || [[ "$NS" == gke-* ]] || [[ "$NS" == gmp-* ]] \
+        || [[ "$NS" == gmp-* ]] || [[ "$NS" == calico-* ]] || [[ "$NS" == tigera-* ]] \
+        || [[ "$NS" == "aks-command" ]] || [[ "$NS" == azure-arc* ]] \
+        || [[ "$NS" == "app-routing-system" ]] || [[ "$NS" == "ingress-appgw" ]] \
+        || [[ "$NS" == "kube-lineage" ]] \
         || [[ "$NS" == "config-management-system" ]] || [[ "$NS" == "gatekeeper-system" ]]; then
         IS_SYSTEM_NS=1
     fi
@@ -137,8 +139,21 @@ while read -r NS; do
         [[ -z "$POD" ]] && continue
         POD_JSON=$(kubectl get pod "$POD" -n "$NS" -o json)
 
-        WI_GSA=$(echo "$POD_JSON" | jq -r '.metadata.annotations["iam.gke.io/gcp-service-account"] // empty')
-        [[ -z "$WI_GSA" ]] && WI_GSA="none"
+        SA_NAME=$(echo "$POD_JSON" | jq -r '.spec.serviceAccountName // "default"')
+
+        WI_CID=$(echo "$POD_JSON" | jq -r '.metadata.annotations["azure.workload.identity/client-id"] // empty')
+        if [[ -z "$WI_CID" ]]; then
+            _sa_json=""
+            _sa_json=$(kubectl get serviceaccount "$SA_NAME" -n "$NS" -o json 2>/dev/null) || _sa_json=""
+            if [[ -n "$_sa_json" ]]; then
+                WI_CID=$(echo "$_sa_json" | jq -r '
+                    .metadata.annotations["azure.workload.identity/client-id"]
+                    // .metadata.annotations["azure.workload.identity/service-account-client-id"]
+                    // empty
+                ')
+            fi
+        fi
+        [[ -z "$WI_CID" ]] && WI_CID="none"
 
         PRIV=$(echo "$POD_JSON" | jq -r '
             [(.spec.initContainers[]?.securityContext.privileged // false),
@@ -179,8 +194,6 @@ while read -r NS; do
             | any(. == true)
             | tostring | ascii_downcase
         ')
-
-        SA_NAME=$(echo "$POD_JSON" | jq -r '.spec.serviceAccountName // "default"')
 
         RUN_AS_USER=$(echo "$POD_JSON" | jq -r '
             [.spec.securityContext.runAsUser,
@@ -469,7 +482,7 @@ while read -r NS; do
             echo "    supplementalGroups: $SUPP_GROUPS"
             echo "    volumeTypes: $VOLUME_TYPES_DISPLAY"
             echo "    automountServiceAccountToken: $AUTOMOUNT_DISPLAY"
-            echo "    workloadIdentityGcpServiceAccount: $WI_GSA"
+            echo "    workloadIdentityClientId: $WI_CID"
             echo "    Capabilities (add): ${CAPS:-None}"
             echo "    Capabilities (drop): $DROPPED_CAPS_STR"
             echo "    Effective caps: $EFFECTIVE_CAPS_STR"
@@ -477,7 +490,7 @@ while read -r NS; do
             echo ""
         elif [[ "$OUTPUT_MODE" == "csv" ]]; then
             EFFECTIVE_ESC=${EFFECTIVE_CAPS_STR//\"/\"\"}
-            echo "\"${NS//\"/\"\"}\",\"${POD//\"/\"\"}\",\"${SA_NAME//\"/\"\"}\",\"$PRIV_DISPLAY\",\"${STATUS//\"/\"\"}\",\"${REQUESTED_CAPS_STR//\"/\"\"}\",\"${DROPPED_CAPS_STR//\"/\"\"}\",\"${EFFECTIVE_ESC}\",\"$ESC_DISPLAY\",\"$HOST_PID\",\"$HOST_NET\",\"$HOST_IPC\",\"${RUN_AS_NONROOT_DISPLAY//\"/\"\"}\",\"${RUN_AS_USER//\"/\"\"}\",\"${RUN_AS_GROUP_DISPLAY//\"/\"\"}\",\"$FSGROUP\",\"${SUPP_GROUPS//\"/\"\"}\",\"${VOLUME_TYPES_DISPLAY//\"/\"\"}\",\"${AUTOMOUNT_DISPLAY//\"/\"\"}\",\"${WI_GSA//\"/\"\"}\""
+            echo "\"${NS//\"/\"\"}\",\"${POD//\"/\"\"}\",\"${SA_NAME//\"/\"\"}\",\"$PRIV_DISPLAY\",\"${STATUS//\"/\"\"}\",\"${REQUESTED_CAPS_STR//\"/\"\"}\",\"${DROPPED_CAPS_STR//\"/\"\"}\",\"${EFFECTIVE_ESC}\",\"$ESC_DISPLAY\",\"$HOST_PID\",\"$HOST_NET\",\"$HOST_IPC\",\"${RUN_AS_NONROOT_DISPLAY//\"/\"\"}\",\"${RUN_AS_USER//\"/\"\"}\",\"${RUN_AS_GROUP_DISPLAY//\"/\"\"}\",\"$FSGROUP\",\"${SUPP_GROUPS//\"/\"\"}\",\"${VOLUME_TYPES_DISPLAY//\"/\"\"}\",\"${AUTOMOUNT_DISPLAY//\"/\"\"}\",\"${WI_CID//\"/\"\"}\""
         elif [[ "$OUTPUT_MODE" == "json" ]]; then
             if [[ ${#EFFECTIVE_POD_ESTIMATE[@]} -eq 0 ]]; then
                 EFFECTIVE_JSON='[]'
@@ -503,7 +516,7 @@ while read -r NS; do
                 --arg sg "$SUPP_GROUPS" \
                 --arg vol "$VOLUME_TYPES_DISPLAY" \
                 --arg am "$AUTOMOUNT_DISPLAY" \
-                --arg wi "$WI_GSA" \
+                --arg wi "$WI_CID" \
                 --arg psa_e "$PSA_ENFORCE" \
                 --arg psa_a "$PSA_AUDIT" \
                 --arg psa_w "$PSA_WARN" \
@@ -530,7 +543,7 @@ while read -r NS; do
                     supplementalGroups: \$sg,
                     volumeTypes: \$vol,
                     automountServiceAccountToken: \$am,
-                    workload_identity_gcp_service_account: \$wi,
+                    workload_identity_client_id: \$wi,
                     psa_enforce: \$psa_e,
                     psa_audit: \$psa_a,
                     psa_warn: \$psa_w

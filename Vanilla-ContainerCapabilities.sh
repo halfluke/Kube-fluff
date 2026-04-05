@@ -1,6 +1,7 @@
 #!/bin/bash
 # Vanilla Kubernetes: pod security audit (PSA labels + pod spec).
-# Uses kubectl and jq on PATH (OpenShift script uses ./jq-linux-amd64 + oc/SCC).
+# Same family as EKS/GKE/AKS *ContainerCapabilities.sh: namespace PSA + declared pod spec only—no live admission
+# simulation; this variant has no cloud identity column. Uses kubectl and jq on PATH (OpenShift uses oc/SCC).
 # "Effective caps (pod estimate)" is NOT admission-accurate — no PSA/SCC admission simulation.
 set -euo pipefail
 
@@ -46,6 +47,7 @@ if ! NS_JSON=$(kubectl get ns -o json 2>/dev/null); then
 fi
 
 echo "Running Kubernetes security audit (PSA + pod-spec capabilities)..."
+echo "[INFO] Pod-spec + PSA labels only (not live admission); no cloud identity column in this script."
 [[ "$ONLY_USER_NS" -eq 1 ]] && echo "Filtering: only non-system namespaces (not openshift-* / kube-*)."
 echo ""
 
