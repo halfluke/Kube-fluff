@@ -46,6 +46,87 @@ These scripts inspect **declared** pod/namespace state. They are **not** full ad
 
 ---
 
+## Node port exposure script
+
+`ControlPlane_WorkerNodes_fromAllPods.sh` probes node ports from all running pods and reports whether access is blocked, auth-gated, or exposed.
+
+- CLI behavior: uses `oc` when available, otherwise falls back to `kubectl`.
+- Requirements: `jq`, `curl`, and `timeout`. Source pods that do not have `curl` and `timeout` are skipped.
+- Runtime modes:
+  - `full`: control-plane nodes are visible; runs control-plane + worker checks.
+  - `worker_only`: control-plane nodes are hidden/unavailable (common in AKS/EKS/GKE); runs worker checks and prints a CP-skipped notice.
+- Default ports:
+  - secure/API endpoints: `2379`, `10250`, `10257`, `10259`
+  - insecure kubelet read-only endpoint: `10255`
+- Port behavior by mode:
+  - `full`: tests `2379`, `10250`, `10257`, `10259` on control-plane nodes, `10250` on worker nodes, and `10255` on all discovered nodes.
+  - `worker_only`: skips control-plane-only checks (`2379`, `10257`, `10259`), tests `10250` and `10255` on discovered worker nodes.
+- etcd probe detail:
+  - `2379` is tested using unauthenticated etcd v3 API request to `/v3/maintenance/status` (not `/`) for more reliable exposure detection.
+- Output format:
+  - `SRC_NS | SRC_POD | HOSTNETWORK | SERVICEACCOUNT | NETPOL_NS_COUNT | NETPOL_MATCH | DEST_ROLE | DEST_IP | PORT | STATUS | DETAILS`
+- Per-pod context:
+  - `HOSTNETWORK`: whether the pod uses `hostNetwork: true`.
+  - `SERVICEACCOUNT`: pod service account name.
+  - `NETPOL_NS_COUNT`: total NetworkPolicies in the pod namespace.
+  - `NETPOL_MATCH`: policies whose `podSelector` structurally matches pod labels.
+  - NetworkPolicy context uses Kubernetes native `networking.k8s.io/v1` `NetworkPolicy` only and is selector-based metadata, not a full enforcement proof across all CNI-specific controls.
+- Status meanings:
+  - `EXPOSED`: unauthenticated access succeeded (highest risk).
+  - `AUTH_REQUIRED`: endpoint reachable but requires authentication/authorization.
+  - `DENIED_WITHOUT_CREDS`: endpoint reachable but denied by TLS/auth/path constraints.
+  - `BLOCKED_OR_UNREACHABLE`: network blocked, timed out, or no route.
+  - `TEST_ERROR`: probe could not complete reliably (missing tools, exec failure, ambiguous transport failure).
+  - `SKIPPED`: source pod missing required probe tools (`curl` and/or `timeout`), so no probes were attempted from that pod.
+- Exit/status mapping (how statuses are determined):
+  - `BLOCKED_OR_UNREACHABLE`: curl/timeout exit code in `{6,7,28,124}`.
+  - `DENIED_WITHOUT_CREDS`: curl exit code in `{35,51,52,56,58,60}` or HTTP `400/404` during auth probe stage.
+  - `TEST_ERROR`: other probe/exec failures or ambiguous transport failures.
+- Risk highlighting:
+  - `EXPOSED` findings are wrapped by:
+    - `=========ALERT=========`
+    - `<result line>`
+    - `=========ALERT=========`
+
+---
+
+## Subject access verifier script
+
+`check_subject_access.sh` evaluates effective RBAC exposure for a specific subject (`User`, `Group`, or `ServiceAccount`) and flags high-risk privilege patterns.
+
+- CLI behavior: uses `oc` when available, otherwise falls back to `kubectl`.
+- Inputs:
+  - `--kind <user|group|serviceaccount>`
+  - `--name <subject-name>` (for service accounts, supports `ns/name`)
+  - optional `--namespace`, `--groups`, `--output <human|json|both>`, `--no-prompt`
+- What it does:
+  - builds effective subject set (direct subject + optional groups)
+  - resolves matching `ClusterRoleBinding` and `RoleBinding` grants
+  - resolves referenced `ClusterRole`/`Role` rules
+  - emits findings for high-risk patterns (for example: `cluster-admin`, wildcard all, `bind`, `escalate`, impersonation, secret read, RBAC writes, node access)
+- Output/exit behavior:
+  - prints human-readable and/or JSON result set with findings summary
+  - exits `1` when high-risk findings are present, `0` otherwise
+
+---
+
+## Endpoint connectivity sweep script
+
+`network_segreg_via_endpoints.sh` performs namespace-to-endpoint connectivity checks by selecting one running curl-capable source pod per namespace, then probing discovered service endpoints.
+
+- CLI behavior: uses `oc` when available, otherwise falls back to `kubectl`.
+- Discovery model:
+  - source pods: one exec-capable pod with `curl` per namespace
+  - targets: EndpointSlice API first, then Endpoints API fallback
+- Probe model:
+  - HTTP connectivity checks to each `endpointIP:port` using timeout-based `curl`
+  - per-source-pod result table plus cluster-wide summary counters
+- Notable outputs:
+  - `SUCCESS`, `TIMED OUT`, `CONNECTION REFUSED/BAD RESPONSE`, `RECV FAILURE`, `UNKNOWN FAILURE`
+  - skipped namespaces list when no curl-capable source pod is available
+
+---
+
 ## Requirements
 
 ### On your workstation
