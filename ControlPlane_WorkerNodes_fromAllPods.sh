@@ -5,7 +5,48 @@ set -eu
 HTTPS_CHECK_PORTS=("2379" "10250" "10257" "10259")
 KUBELET_HTTP_RO_PORT="10255"
 TIMEOUT=3
+CONNECT_TIMEOUT=3
+OUTPUT_MODE="human"
+NAMESPACE_FILTER_RAW=""
+MAX_PODS=0
+TRUNCATE_LIMIT=120
 # --- End Configuration ---
+
+usage() {
+    cat <<'EOF'
+Usage:
+  ControlPlane_WorkerNodes_fromAllPods.sh [options]
+
+Options:
+  --namespaces ns1,ns2      Only test pods in listed namespaces
+  --output human|jsonl      Output mode (default: human)
+  --timeout N               Overall timeout seconds for probe commands (default: 3)
+  --connect-timeout N       curl connect-timeout seconds (default: 3)
+  --max-pods N              Max number of running pods to test (0 = all, default: 0)
+  -h, --help                Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --namespaces) NAMESPACE_FILTER_RAW="${2:-}"; shift 2 ;;
+        --output) OUTPUT_MODE="${2:-}"; shift 2 ;;
+        --timeout) TIMEOUT="${2:-}"; shift 2 ;;
+        --connect-timeout) CONNECT_TIMEOUT="${2:-}"; shift 2 ;;
+        --max-pods) MAX_PODS="${2:-}"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Error: Unknown option '$1'"; usage; exit 2 ;;
+    esac
+done
+
+if [[ ! "$OUTPUT_MODE" =~ ^(human|jsonl)$ ]]; then
+    echo "Error: --output must be human or jsonl."
+    exit 2
+fi
+if [[ ! "$TIMEOUT" =~ ^[0-9]+$ ]] || [[ ! "$CONNECT_TIMEOUT" =~ ^[0-9]+$ ]] || [[ ! "$MAX_PODS" =~ ^[0-9]+$ ]]; then
+    echo "Error: --timeout, --connect-timeout, and --max-pods must be integers."
+    exit 2
+fi
 
 if command -v oc >/dev/null 2>&1; then
     KCLI="oc"
@@ -24,6 +65,13 @@ if ! command -v jq >/dev/null 2>&1; then
     echo "Error: 'jq' is required on the host running this script."
     exit 1
 fi
+
+declare -A STATUS_COUNTS
+declare -A PORT_STATUS_COUNTS
+TOTAL_PODS_CONSIDERED=0
+TOTAL_PODS_TESTED=0
+TOTAL_PODS_SKIPPED=0
+TOTAL_PODS_SAMPLED_OUT=0
 
 contains_exact_ip() {
     local needle="${1:-}"
@@ -73,20 +121,67 @@ resolve_node_role() {
     fi
 }
 
+truncate_value() {
+    local val="${1:-}"
+    if [[ ${#val} -le $TRUNCATE_LIMIT ]]; then
+        printf "%s" "$val"
+    else
+        printf "%s...(+truncated)" "${val:0:$TRUNCATE_LIMIT}"
+    fi
+}
+
+emit_finding() {
+    local src_namespace="${1:-}" src_name="${2:-}" host_network="${3:-}" service_account="${4:-}" netpol_count="${5:-}" netpol_match="${6:-}" policy_engine="${7:-}" plugin_policy_count="${8:-}" plugin_policy_refs="${9:-}" dest_role="${10:-}" ip="${11:-}" port="${12:-}" status="${13:-}" details="${14:-}"
+    local risk="false"
+    if [[ "$status" == "EXPOSED" ]]; then
+        risk="true"
+    fi
+
+    STATUS_COUNTS["$status"]=$(( ${STATUS_COUNTS["$status"]:-0} + 1 ))
+    if [[ "$port" != "-" ]]; then
+        PORT_STATUS_COUNTS["$port|$status"]=$(( ${PORT_STATUS_COUNTS["$port|$status"]:-0} + 1 ))
+    fi
+
+    if [[ "$OUTPUT_MODE" == "jsonl" ]]; then
+        jq -cn \
+          --arg src_namespace "$src_namespace" \
+          --arg src_pod "$src_name" \
+          --arg host_network "$host_network" \
+          --arg service_account "$service_account" \
+          --arg netpol_ns_count "$netpol_count" \
+          --arg netpol_match "$netpol_match" \
+          --arg policy_engine "$policy_engine" \
+          --arg plugin_policy_count "$plugin_policy_count" \
+          --arg plugin_policy_refs "$plugin_policy_refs" \
+          --arg dest_role "$dest_role" \
+          --arg dest_ip "$ip" \
+          --arg port "$port" \
+          --arg status "$status" \
+          --arg details "$details" \
+          --arg risk "$risk" \
+          '{src_namespace:$src_namespace,src_pod:$src_pod,hostNetwork:$host_network,serviceAccount:$service_account,netpol_ns_count:$netpol_ns_count,netpol_match:$netpol_match,policy_engine:$policy_engine,plugin_policy_count:$plugin_policy_count,plugin_policy_refs:$plugin_policy_refs,dest_role:$dest_role,dest_ip:$dest_ip,port:$port,status:$status,details:$details,risk:($risk=="true")}'
+    else
+        if [[ "$status" == "EXPOSED" ]]; then
+            echo "=========ALERT========="
+        fi
+        printf "%s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s\n" \
+            "$src_namespace" "$src_name" "$host_network" "$service_account" "$netpol_count" "$(truncate_value "$netpol_match")" \
+            "$policy_engine" "$plugin_policy_count" "$(truncate_value "$plugin_policy_refs")" \
+            "$dest_role" "$ip" "$port" "$status" "$details"
+        if [[ "$status" == "EXPOSED" ]]; then
+            echo "=========ALERT========="
+        fi
+    fi
+}
+
 print_result() {
     local src_namespace="${1:-}" src_name="${2:-}" host_network="${3:-}" service_account="${4:-}" netpol_count="${5:-}" netpol_match="${6:-}" dest_role="${7:-}" ip="${8:-}" port="${9:-}" status="${10:-}" details="${11:-}"
-    if [[ "$status" == "EXPOSED" ]]; then
-        echo "=========ALERT========="
-    fi
-    printf "%s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s\n" "$src_namespace" "$src_name" "$host_network" "$service_account" "$netpol_count" "$netpol_match" "$dest_role" "$ip" "$port" "$status" "$details"
-    if [[ "$status" == "EXPOSED" ]]; then
-        echo "=========ALERT========="
-    fi
+    emit_finding "$src_namespace" "$src_name" "$host_network" "$service_account" "$netpol_count" "$netpol_match" "${POD_POLICY_ENGINE:-k8s-native}" "${POD_PLUGIN_POLICY_COUNT:-0}" "${POD_PLUGIN_POLICY_REFS:--}" "$dest_role" "$ip" "$port" "$status" "$details"
 }
 
 test_connection_simple() {
     local src_namespace="${1:-}" src_name="${2:-}" host_network="${3:-}" service_account="${4:-}" netpol_count="${5:-}" netpol_match="${6:-}" dest_role="${7:-}" ip="${8:-}" port="${9:-}"
-    local probe_cmd="command -v curl >/dev/null 2>&1 || exit 127; timeout $TIMEOUT curl -s -o /dev/null -m $TIMEOUT http://$ip:$port"
+    local probe_cmd="command -v curl >/dev/null 2>&1 || exit 127; timeout $TIMEOUT curl -s -o /dev/null --connect-timeout $CONNECT_TIMEOUT -m $TIMEOUT http://$ip:$port"
     local rc
     rc=$(run_exec_probe "$src_namespace" "$src_name" "$probe_cmd")
 
@@ -109,9 +204,9 @@ test_auth_status_https() {
     local probe_cmd=""
     if [[ "$port" == "2379" ]]; then
         # etcd API auth behavior is better tested against v3 API than "/".
-        probe_cmd="command -v curl >/dev/null 2>&1 || exit 127; timeout $TIMEOUT curl -sk -m $TIMEOUT -o /dev/null -H 'Content-Type: application/json' -d '{}' https://$ip:$port/v3/maintenance/status"
+        probe_cmd="command -v curl >/dev/null 2>&1 || exit 127; timeout $TIMEOUT curl -sk --connect-timeout $CONNECT_TIMEOUT -m $TIMEOUT -o /dev/null -H 'Content-Type: application/json' -d '{}' https://$ip:$port/v3/maintenance/status"
     else
-        probe_cmd="command -v curl >/dev/null 2>&1 || exit 127; timeout $TIMEOUT curl -sk -m $TIMEOUT -o /dev/null https://$ip:$port$endpoint"
+        probe_cmd="command -v curl >/dev/null 2>&1 || exit 127; timeout $TIMEOUT curl -sk --connect-timeout $CONNECT_TIMEOUT -m $TIMEOUT -o /dev/null https://$ip:$port$endpoint"
     fi
     local reach_rc
     reach_rc=$(run_exec_probe "$src_namespace" "$src_name" "$probe_cmd")
@@ -133,9 +228,9 @@ test_auth_status_https() {
 
     local code_cmd
     if [[ "$port" == "2379" ]]; then
-        code_cmd="command -v curl >/dev/null 2>&1 || exit 127; timeout $TIMEOUT curl -sk -m $TIMEOUT -o /dev/null -w '%{http_code}:%{exitcode}' -H 'Content-Type: application/json' -d '{}' https://$ip:$port/v3/maintenance/status"
+        code_cmd="command -v curl >/dev/null 2>&1 || exit 127; timeout $TIMEOUT curl -sk --connect-timeout $CONNECT_TIMEOUT -m $TIMEOUT -o /dev/null -w '%{http_code}:%{exitcode}' -H 'Content-Type: application/json' -d '{}' https://$ip:$port/v3/maintenance/status"
     else
-        code_cmd="command -v curl >/dev/null 2>&1 || exit 127; timeout $TIMEOUT curl -sk -m $TIMEOUT -o /dev/null -w '%{http_code}:%{exitcode}' https://$ip:$port$endpoint"
+        code_cmd="command -v curl >/dev/null 2>&1 || exit 127; timeout $TIMEOUT curl -sk --connect-timeout $CONNECT_TIMEOUT -m $TIMEOUT -o /dev/null -w '%{http_code}:%{exitcode}' https://$ip:$port$endpoint"
     fi
     set +e
     local http_out
@@ -238,35 +333,79 @@ else
         echo "Info: No worker-labeled nodes were detected. Running control-plane-only checks."
     fi
 fi
-echo "---------------------------------------------------------------------"
-echo "Testing connectivity from all running pods..."
-echo "Status legend:"
-echo "- EXPOSED: unauthenticated access succeeded."
-echo "- AUTH_REQUIRED: endpoint reachable but requires auth."
-echo "- DENIED_WITHOUT_CREDS: reachable but denied by TLS/auth/path constraints."
-echo "- BLOCKED_OR_UNREACHABLE: network path blocked, timed out, or no route."
-echo "- TEST_ERROR: probe could not be completed reliably."
-echo "- SKIPPED: source pod missing required probe tools (curl/timeout)."
-echo "- NETPOL_* fields are based on Kubernetes native NetworkPolicy objects only (networking.k8s.io/v1)."
-echo "  They do not include CNI-specific policy engines (for example Calico GlobalNetworkPolicy)."
-echo "Connectivity/transport code mapping:"
-echo "- BLOCKED_OR_UNREACHABLE: curl/timeout rc in {6,7,28,124}"
-echo "- DENIED_WITHOUT_CREDS: curl rc in {51,58,60} or HTTP 400/404 in auth probe stage"
-echo "- TEST_ERROR: any other probe/exec failure or ambiguous rc"
-echo "- EXPOSED findings are wrapped with =========ALERT========= lines."
-echo "Format: SRC_NS | SRC_POD | HOSTNETWORK | SERVICEACCOUNT | NETPOL_NS_COUNT | NETPOL_MATCH | DEST_ROLE | DEST_IP | PORT | STATUS | DETAILS"
-echo "---------------------------------------------------------------------"
+PRE_NODE_COUNT=$("$KCLI" get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')
+if "$KCLI" cluster-info >/dev/null 2>&1; then PRE_API_HEALTH="ok"; else PRE_API_HEALTH="unreachable"; fi
+
+if [[ "$OUTPUT_MODE" == "human" ]]; then
+    echo "---------------------------------------------------------------------"
+    echo "Testing connectivity from all running pods..."
+    echo "Status legend:"
+    echo "- EXPOSED: unauthenticated access succeeded."
+    echo "- AUTH_REQUIRED: endpoint reachable but requires auth."
+    echo "- DENIED_WITHOUT_CREDS: reachable but denied by TLS/auth/path constraints."
+    echo "- BLOCKED_OR_UNREACHABLE: network path blocked, timed out, or no route."
+    echo "- TEST_ERROR: probe could not be completed reliably."
+    echo "- SKIPPED: source pod missing required probe tools (curl/timeout)."
+    echo "- NETPOL_* fields are based on Kubernetes native NetworkPolicy objects only (networking.k8s.io/v1)."
+    echo "  They do not include CNI-specific policy engines (for example Calico GlobalNetworkPolicy)."
+    echo "Connectivity/transport code mapping:"
+    echo "- BLOCKED_OR_UNREACHABLE: curl/timeout rc in {6,7,28,124}"
+    echo "- DENIED_WITHOUT_CREDS: curl rc in {51,58,60} or HTTP 400/404 in auth probe stage"
+    echo "- TEST_ERROR: any other probe/exec failure or ambiguous rc"
+    echo "- EXPOSED findings are wrapped with =========ALERT========= lines."
+    echo "Format: SRC_NS | SRC_POD | HOSTNETWORK | SERVICEACCOUNT | NETPOL_NS_COUNT | NETPOL_MATCH | POLICY_ENGINE | PLUGIN_POLICY_COUNT | PLUGIN_POLICY_REFS | DEST_ROLE | DEST_IP | PORT | STATUS | DETAILS"
+    echo "Pre-check: API=$PRE_API_HEALTH | NODE_COUNT=$PRE_NODE_COUNT"
+    echo "---------------------------------------------------------------------"
+else
+    jq -cn --arg type "meta" --arg stage "precheck" --arg api "$PRE_API_HEALTH" --arg node_count "$PRE_NODE_COUNT" '{type:$type,stage:$stage,api:$api,node_count:($node_count|tonumber)}'
+fi
 PODS_JSON=$("$KCLI" get pods -A -o json)
 set +e
 NETPOL_JSON=$("$KCLI" get networkpolicy -A -o json 2>/dev/null)
 NETPOL_RC=$?
+
+CALICO_NS_JSON=$("$KCLI" get networkpolicies.crd.projectcalico.org -A -o json 2>/dev/null)
+CALICO_NS_RC=$?
+CALICO_GLOBAL_JSON=$("$KCLI" get globalnetworkpolicies.crd.projectcalico.org -o json 2>/dev/null)
+CALICO_GLOBAL_RC=$?
+
+CILIUM_NS_JSON=$("$KCLI" get ciliumnetworkpolicies.cilium.io -A -o json 2>/dev/null)
+CILIUM_NS_RC=$?
+CILIUM_CLUSTER_JSON=$("$KCLI" get ciliumclusterwidenetworkpolicies.cilium.io -o json 2>/dev/null)
+CILIUM_CLUSTER_RC=$?
+CRD_JSON=$("$KCLI" get crd -o json 2>/dev/null)
+CRD_RC=$?
 set -e
 if [[ $NETPOL_RC -ne 0 ]]; then
     NETPOL_JSON='{"items":[]}'
     echo "Warning: Could not read NetworkPolicies with $KCLI. NETPOL context will be n/a."
 fi
+if [[ $CALICO_NS_RC -ne 0 ]]; then CALICO_NS_JSON='{"items":[]}'; fi
+if [[ $CALICO_GLOBAL_RC -ne 0 ]]; then CALICO_GLOBAL_JSON='{"items":[]}'; fi
+if [[ $CILIUM_NS_RC -ne 0 ]]; then CILIUM_NS_JSON='{"items":[]}'; fi
+if [[ $CILIUM_CLUSTER_RC -ne 0 ]]; then CILIUM_CLUSTER_JSON='{"items":[]}'; fi
+if [[ $CRD_RC -ne 0 ]]; then CRD_JSON='{"items":[]}'; fi
 
-echo "$PODS_JSON" | jq -rc '.items[] | select(.status.phase=="Running") | [.metadata.namespace, .metadata.name, (.spec.hostNetwork // false), (.spec.serviceAccountName // "default"), (.metadata.labels // {})] | @base64' | while read -r pod_rec; do
+NAMESPACE_FILTER_JSON=$(printf "%s" "$NAMESPACE_FILTER_RAW" | tr ',' '\n' | sed '/^$/d' | jq -R . | jq -s .)
+if [[ "$NAMESPACE_FILTER_RAW" == "" ]]; then
+    NAMESPACE_FILTER_JSON='[]'
+fi
+
+mapfile -t RUNNING_PODS < <(echo "$PODS_JSON" | jq -rc --argjson ns_filter "$NAMESPACE_FILTER_JSON" '
+  .items[]
+  | select(.status.phase=="Running")
+  | select(($ns_filter|length)==0 or (.metadata.namespace as $n | any($ns_filter[]; . == $n)))
+  | [.metadata.namespace, .metadata.name, (.spec.hostNetwork // false), (.spec.serviceAccountName // "default"), (.metadata.labels // {})]
+  | @base64
+')
+
+TOTAL_PODS_CONSIDERED=${#RUNNING_PODS[@]}
+if [[ "$MAX_PODS" -gt 0 ]] && [[ ${#RUNNING_PODS[@]} -gt "$MAX_PODS" ]]; then
+    TOTAL_PODS_SAMPLED_OUT=$(( ${#RUNNING_PODS[@]} - MAX_PODS ))
+    RUNNING_PODS=("${RUNNING_PODS[@]:0:$MAX_PODS}")
+fi
+
+for pod_rec in "${RUNNING_PODS[@]}"; do
     pod_data=$(printf "%s" "$pod_rec" | base64 -d)
     src_namespace=$(printf "%s" "$pod_data" | jq -r '.[0]')
     src_name=$(printf "%s" "$pod_data" | jq -r '.[1]')
@@ -301,11 +440,84 @@ echo "$PODS_JSON" | jq -rc '.items[] | select(.status.phase=="Running") | [.meta
         netpol_match="n/a"
     fi
 
+    # Plugin policy context is additive to native NetworkPolicy context.
+    plugin_engine_parts=("k8s-native")
+    plugin_refs=()
+    plugin_count=0
+
+    if [[ $CALICO_NS_RC -eq 0 ]] || [[ $CALICO_GLOBAL_RC -eq 0 ]]; then
+        plugin_engine_parts+=("calico")
+        calico_ns_count=$(printf "%s" "$CALICO_NS_JSON" | jq --arg ns "$src_namespace" '[.items[] | select(.metadata.namespace == $ns)] | length')
+        calico_global_count=$(printf "%s" "$CALICO_GLOBAL_JSON" | jq '[.items[]] | length')
+        plugin_count=$((plugin_count + calico_ns_count + calico_global_count))
+        if [[ "$calico_ns_count" -gt 0 ]]; then
+            calico_ns_refs=$(printf "%s" "$CALICO_NS_JSON" | jq -r --arg ns "$src_namespace" '[.items[] | select(.metadata.namespace == $ns) | "calico-np/\(.metadata.namespace)/\(.metadata.name)"] | join(",")')
+            [[ -n "$calico_ns_refs" ]] && plugin_refs+=("$calico_ns_refs")
+        fi
+        if [[ "$calico_global_count" -gt 0 ]]; then
+            calico_global_refs=$(printf "%s" "$CALICO_GLOBAL_JSON" | jq -r '[.items[] | "calico-gnp/\(.metadata.name)"] | join(",")')
+            [[ -n "$calico_global_refs" ]] && plugin_refs+=("$calico_global_refs")
+        fi
+    fi
+
+    if [[ $CILIUM_NS_RC -eq 0 ]] || [[ $CILIUM_CLUSTER_RC -eq 0 ]]; then
+        plugin_engine_parts+=("cilium")
+        cilium_ns_count=$(printf "%s" "$CILIUM_NS_JSON" | jq --arg ns "$src_namespace" '[.items[] | select(.metadata.namespace == $ns)] | length')
+        cilium_cluster_count=$(printf "%s" "$CILIUM_CLUSTER_JSON" | jq '[.items[]] | length')
+        plugin_count=$((plugin_count + cilium_ns_count + cilium_cluster_count))
+        if [[ "$cilium_ns_count" -gt 0 ]]; then
+            cilium_ns_refs=$(printf "%s" "$CILIUM_NS_JSON" | jq -r --arg ns "$src_namespace" '[.items[] | select(.metadata.namespace == $ns) | "cilium-np/\(.metadata.namespace)/\(.metadata.name)"] | join(",")')
+            [[ -n "$cilium_ns_refs" ]] && plugin_refs+=("$cilium_ns_refs")
+        fi
+        if [[ "$cilium_cluster_count" -gt 0 ]]; then
+            cilium_cluster_refs=$(printf "%s" "$CILIUM_CLUSTER_JSON" | jq -r '[.items[] | "cilium-ccnp/\(.metadata.name)"] | join(",")')
+            [[ -n "$cilium_cluster_refs" ]] && plugin_refs+=("$cilium_cluster_refs")
+        fi
+    fi
+
+    if [[ $CRD_RC -eq 0 ]]; then
+        heuristic_engine_parts=()
+        while IFS= read -r grp; do
+            [[ -z "$grp" ]] && continue
+            # Avoid duplicating known engine groups already represented.
+            if [[ "$grp" == "networking.k8s.io" ]] || [[ "$grp" == "policy.networking.k8s.io" ]] || [[ "$grp" == "projectcalico.org" ]] || [[ "$grp" == "cilium.io" ]] || [[ "$grp" == *.projectcalico.org ]] || [[ "$grp" == *.cilium.io ]]; then
+                continue
+            fi
+            heuristic_engine_parts+=("heuristic:$grp")
+        done < <(printf "%s" "$CRD_JSON" | jq -r '
+          [
+            .items[]
+            | {
+                n: (.metadata.name // ""),
+                g: (.spec.group // "")
+              }
+            | select(
+                (.n | test("networkpolic|policy|egress|ingress"; "i")) or
+                (.g | test("policy|network"; "i"))
+              )
+            | .g
+          ] | unique[]?
+        ')
+        if [[ ${#heuristic_engine_parts[@]} -gt 0 ]]; then
+            plugin_engine_parts+=("${heuristic_engine_parts[@]}")
+        fi
+    fi
+
+    POD_POLICY_ENGINE=$(printf "%s\n" "${plugin_engine_parts[@]}" | jq -R . | jq -s -r 'unique | join(",")')
+    POD_PLUGIN_POLICY_COUNT="$plugin_count"
+    if [[ ${#plugin_refs[@]} -eq 0 ]]; then
+        POD_PLUGIN_POLICY_REFS="-"
+    else
+        POD_PLUGIN_POLICY_REFS=$(printf "%s," "${plugin_refs[@]}" | sed 's/,$//')
+    fi
+
     preflight_rc=$(run_exec_probe "$src_namespace" "$src_name" "command -v curl >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1")
     if [[ "$preflight_rc" -ne 0 ]]; then
+        TOTAL_PODS_SKIPPED=$((TOTAL_PODS_SKIPPED + 1))
         print_result "$src_namespace" "$src_name" "$host_network" "$service_account" "$netpol_count" "$netpol_match" "-" "-" "-" "SKIPPED" "Missing required tools in source pod (need curl + timeout; rc=$preflight_rc)."
         continue
     fi
+    TOTAL_PODS_TESTED=$((TOTAL_PODS_TESTED + 1))
 
     for ip in "${ALL_NODES_IPS[@]}"; do
         NODE_ROLE=$(resolve_node_role "$ip")
@@ -325,5 +537,36 @@ echo "$PODS_JSON" | jq -rc '.items[] | select(.status.phase=="Running") | [.meta
     done
 done
 
-echo "---------------------------------------------------------------------"
-echo "Cluster port connectivity test complete."
+POST_NODE_COUNT=$("$KCLI" get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')
+if "$KCLI" cluster-info >/dev/null 2>&1; then POST_API_HEALTH="ok"; else POST_API_HEALTH="unreachable"; fi
+
+if [[ "$OUTPUT_MODE" == "human" ]]; then
+    echo "---------------------------------------------------------------------"
+    echo "Coverage summary:"
+    echo "  Pods considered:   $TOTAL_PODS_CONSIDERED"
+    echo "  Pods tested:       $TOTAL_PODS_TESTED"
+    echo "  Pods skipped:      $TOTAL_PODS_SKIPPED"
+    echo "  Pods sampled out:  $TOTAL_PODS_SAMPLED_OUT"
+    echo "Status summary:"
+    for key in "${!STATUS_COUNTS[@]}"; do
+        echo "  $key: ${STATUS_COUNTS[$key]}"
+    done
+    echo "Per-port status summary:"
+    for key in "${!PORT_STATUS_COUNTS[@]}"; do
+        echo "  $key: ${PORT_STATUS_COUNTS[$key]}"
+    done
+    echo "Post-check: API=$POST_API_HEALTH | NODE_COUNT=$POST_NODE_COUNT"
+    echo "Cluster port connectivity test complete."
+else
+    jq -cn \
+      --arg type "summary" \
+      --argjson pods_considered "$TOTAL_PODS_CONSIDERED" \
+      --argjson pods_tested "$TOTAL_PODS_TESTED" \
+      --argjson pods_skipped "$TOTAL_PODS_SKIPPED" \
+      --argjson pods_sampled_out "$TOTAL_PODS_SAMPLED_OUT" \
+      --arg pre_api "$PRE_API_HEALTH" \
+      --arg post_api "$POST_API_HEALTH" \
+      --argjson pre_nodes "${PRE_NODE_COUNT:-0}" \
+      --argjson post_nodes "${POST_NODE_COUNT:-0}" \
+      '{type:$type,pods_considered:$pods_considered,pods_tested:$pods_tested,pods_skipped:$pods_skipped,pods_sampled_out:$pods_sampled_out,pre_api:$pre_api,post_api:$post_api,pre_node_count:$pre_nodes,post_node_count:$post_nodes}'
+fi

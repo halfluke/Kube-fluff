@@ -52,6 +52,12 @@ These scripts inspect **declared** pod/namespace state. They are **not** full ad
 
 - CLI behavior: uses `oc` when available, otherwise falls back to `kubectl`.
 - Requirements: `jq`, `curl`, and `timeout`. Source pods that do not have `curl` and `timeout` are skipped.
+- Additional flags:
+  - `--namespaces ns1,ns2`
+  - `--output human|jsonl`
+  - `--timeout N`
+  - `--connect-timeout N`
+  - `--max-pods N` (sample running pods; `0` means all)
 - Runtime modes:
   - `full`: control-plane nodes are visible; runs control-plane + worker checks.
   - `worker_only`: control-plane nodes are hidden/unavailable (common in AKS/EKS/GKE); runs worker checks and prints a CP-skipped notice.
@@ -64,13 +70,16 @@ These scripts inspect **declared** pod/namespace state. They are **not** full ad
 - etcd probe detail:
   - `2379` is tested using unauthenticated etcd v3 API request to `/v3/maintenance/status` (not `/`) for more reliable exposure detection.
 - Output format:
-  - `SRC_NS | SRC_POD | HOSTNETWORK | SERVICEACCOUNT | NETPOL_NS_COUNT | NETPOL_MATCH | DEST_ROLE | DEST_IP | PORT | STATUS | DETAILS`
+  - `SRC_NS | SRC_POD | HOSTNETWORK | SERVICEACCOUNT | NETPOL_NS_COUNT | NETPOL_MATCH | POLICY_ENGINE | PLUGIN_POLICY_COUNT | PLUGIN_POLICY_REFS | DEST_ROLE | DEST_IP | PORT | STATUS | DETAILS`
+  - In `jsonl` mode, each finding is emitted as one JSON object including `risk` boolean.
 - Per-pod context:
   - `HOSTNETWORK`: whether the pod uses `hostNetwork: true`.
   - `SERVICEACCOUNT`: pod service account name.
   - `NETPOL_NS_COUNT`: total NetworkPolicies in the pod namespace.
   - `NETPOL_MATCH`: policies whose `podSelector` structurally matches pod labels.
-  - NetworkPolicy context uses Kubernetes native `networking.k8s.io/v1` `NetworkPolicy` only and is selector-based metadata, not a full enforcement proof across all CNI-specific controls.
+  - `POLICY_ENGINE`: comma-separated engine list beginning with `k8s-native`, then detected known engines (for example `calico`, `cilium`) plus heuristic engine identifiers from policy-like CRD groups (for example `heuristic:policy.networking.k8s.io`).
+  - `PLUGIN_POLICY_COUNT`/`PLUGIN_POLICY_REFS`: additive plugin-policy metadata (for example Calico and Cilium CRDs), not a full effective-policy evaluator.
+  - Native and plugin contexts are metadata for triage and are not a guaranteed end-to-end enforcement proof.
 - Status meanings:
   - `EXPOSED`: unauthenticated access succeeded (highest risk).
   - `AUTH_REQUIRED`: endpoint reachable but requires authentication/authorization.
@@ -80,13 +89,18 @@ These scripts inspect **declared** pod/namespace state. They are **not** full ad
   - `SKIPPED`: source pod missing required probe tools (`curl` and/or `timeout`), so no probes were attempted from that pod.
 - Exit/status mapping (how statuses are determined):
   - `BLOCKED_OR_UNREACHABLE`: curl/timeout exit code in `{6,7,28,124}`.
-  - `DENIED_WITHOUT_CREDS`: curl exit code in `{35,51,52,56,58,60}` or HTTP `400/404` during auth probe stage.
+  - `DENIED_WITHOUT_CREDS`: curl exit code in `{51,58,60}` or HTTP `400/404` during auth probe stage.
   - `TEST_ERROR`: other probe/exec failures or ambiguous transport failures.
 - Risk highlighting:
   - `EXPOSED` findings are wrapped by:
     - `=========ALERT=========`
     - `<result line>`
     - `=========ALERT=========`
+- Summaries:
+  - coverage counters (`pods considered/tested/skipped/sampled-out`)
+  - status rollups and per-port rollups
+  - pre/post API reachability and node count guard lines
+  - `UNKNOWN_POLICY_CRD_GROUPS` metadata for heuristic plugin coverage gaps
 
 ---
 
@@ -95,6 +109,11 @@ These scripts inspect **declared** pod/namespace state. They are **not** full ad
 `check_subject_access.sh` evaluates effective RBAC exposure for a specific subject (`User`, `Group`, or `ServiceAccount`) and flags high-risk privilege patterns.
 
 - CLI behavior: uses `oc` when available, otherwise falls back to `kubectl`.
+- Additional flags:
+  - `--namespaces ns1,ns2`
+  - `--output human|jsonl`
+  - `--timeout N`
+  - `--connect-timeout N`
 - Inputs:
   - `--kind <user|group|serviceaccount>`
   - `--name <subject-name>` (for service accounts, supports `ns/name`)
@@ -121,6 +140,14 @@ These scripts inspect **declared** pod/namespace state. They are **not** full ad
 - Probe model:
   - HTTP connectivity checks to each `endpointIP:port` using timeout-based `curl`
   - per-source-pod result table plus cluster-wide summary counters
+- Status taxonomy:
+  - `EXPOSED`, `BLOCKED_OR_UNREACHABLE`, `DENIED_WITHOUT_CREDS`, `TEST_ERROR`
+  - `EXPOSED` is wrapped with alert lines in human mode; `risk=true` in jsonl mode
+- Source context model (additive):
+  - Native Kubernetes `NetworkPolicy` context: namespace policy count + selector-based policy matches for the selected source pod.
+  - Plugin policy context (if detected): Calico/Cilium CRD counts and references are surfaced as metadata alongside native context.
+  - Plugin metadata complements, not replaces, native `networking.k8s.io/v1` policy context.
+- Unknown policy-like CRD groups are surfaced as summary metadata to indicate potential coverage gaps.
 - Notable outputs:
   - `SUCCESS`, `TIMED OUT`, `CONNECTION REFUSED/BAD RESPONSE`, `RECV FAILURE`, `UNKNOWN FAILURE`
   - skipped namespaces list when no curl-capable source pod is available
