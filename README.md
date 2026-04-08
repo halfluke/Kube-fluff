@@ -8,7 +8,27 @@ These tools are intended for **analysis, education, and lab environments**. They
 
 ---
 
-## What the scripts do
+## Quickstart
+
+```bash
+cd /path/to/Kube-fluff
+chmod +x *.sh   # once, if needed
+```
+
+1) Configure cluster access so `kubectl get ns` succeeds (see Requirements section for EKS/GKE/AKS examples).  
+2) Pick the script matching your target.  
+3) Start with:
+
+```bash
+./Vanilla-RBAC.sh --quiet
+./Vanilla-ContainerCapabilities.sh --output text
+```
+
+For cloud targets, use the cloud-specific script variants (`EKS-*`, `GKE-*`, `AKS-*`).
+
+---
+
+## Script guide
 
 ### RBAC audit scripts
 
@@ -21,16 +41,6 @@ These tools are intended for **analysis, education, and lab environments**. They
 | `OpenShift-RBAC.sh` | OpenShift | Same CLI style as Vanilla-RBAC; uses **`oc`**; OpenShift-focused namespace defaults |
 
 RBAC scripts answer: **who can perform high-risk API actions** (cluster-admin, secrets, exec, token minting, wildcards, CRD exposure heuristics, etc.). Each script documents semantics in its file header (bindings, `via =/≠`, excluded namespaces).
-
-**Vanilla-RBAC.sh and the API:** When you run checks **3–19** or a full audit (no `--checks`), the script **prefetches once** per run: ClusterRoleBindings, all RoleBindings, and combined ClusterRoles/Roles. Most checks reuse that JSON (including `check_permission` and subject resolution), which avoids repeated full list calls. **`--checks=1` and/or `2` only** skips that prefetch. Check **19** still calls workload APIs to read ServiceAccount names on pods and controllers; its cluster/namespace summary **counts** use `kubectl get … --no-headers` style listing instead of pulling full resource JSON for totals.
-
-**Cloud “Check 2” notes (read the script headers):**
-
-- **EKS:** Reads **`kube-system/aws-auth`** for `mapRoles` / `mapUsers` entries mapping to **`system:masters`**. Not a full AWS/EKS access audit (e.g. Access Entry APIs, IRSA, node IAM).
-- **GKE:** Uses **`gcloud container clusters get-iam-policy`** on the **cluster resource** for `roles/container.clusterAdmin` and `roles/container.admin`. Parent project/folder/org bindings may not appear.
-- **AKS:** Uses **`az role assignment list`** at the **managed cluster ARM scope** (and CLI-specific `--all` behavior). Not a complete map of Azure paths to cluster admin.
-
-When Check 2 runs, the scripts print a short **scope line** (unless `--quiet`) so operators know what is included.
 
 ### Container capabilities / PSA scripts
 
@@ -46,111 +56,37 @@ These scripts inspect **declared** pod/namespace state. They are **not** full ad
 
 ---
 
-## Node port exposure script
+## Other scripts (quick reference)
 
 `ControlPlane_WorkerNodes_fromAllPods.sh` probes node ports from all running pods and reports whether access is blocked, auth-gated, or exposed.
 
-- CLI behavior: uses `oc` when available, otherwise falls back to `kubectl`.
-- Requirements: `jq`, `curl`, and `timeout`. Source pods that do not have `curl` and `timeout` are skipped.
-- Additional flags:
-  - `--namespaces ns1,ns2`
-  - `--output human|jsonl`
-  - `--timeout N`
-  - `--connect-timeout N`
-  - `--max-pods N` (sample running pods; `0` means all)
-- Runtime modes:
-  - `full`: control-plane nodes are visible; runs control-plane + worker checks.
-  - `worker_only`: control-plane nodes are hidden/unavailable (common in AKS/EKS/GKE); runs worker checks and prints a CP-skipped notice.
-- Default ports:
-  - secure/API endpoints: `2379`, `10250`, `10257`, `10259`
-  - insecure kubelet read-only endpoint: `10255`
-- Port behavior by mode:
-  - `full`: tests `2379`, `10250`, `10257`, `10259` on control-plane nodes, `10250` on worker nodes, and `10255` on all discovered nodes.
-  - `worker_only`: skips control-plane-only checks (`2379`, `10257`, `10259`), tests `10250` and `10255` on discovered worker nodes.
-- etcd probe detail:
-  - `2379` is tested using unauthenticated etcd v3 API request to `/v3/maintenance/status` (not `/`) for more reliable exposure detection.
-- Output format:
-  - `SRC_NS | SRC_POD | HOSTNETWORK | SERVICEACCOUNT | NETPOL_NS_COUNT | NETPOL_MATCH | POLICY_ENGINE | PLUGIN_POLICY_COUNT | PLUGIN_POLICY_REFS | DEST_ROLE | DEST_IP | PORT | STATUS | DETAILS`
-  - In `jsonl` mode, each finding is emitted as one JSON object including `risk` boolean.
-- Per-pod context:
-  - `HOSTNETWORK`: whether the pod uses `hostNetwork: true`.
-  - `SERVICEACCOUNT`: pod service account name.
-  - `NETPOL_NS_COUNT`: total NetworkPolicies in the pod namespace.
-  - `NETPOL_MATCH`: policies whose `podSelector` structurally matches pod labels.
-  - `POLICY_ENGINE`: comma-separated engine list beginning with `k8s-native`, then detected known engines (for example `calico`, `cilium`) plus heuristic engine identifiers from policy-like CRD groups (for example `heuristic:policy.networking.k8s.io`).
-  - `PLUGIN_POLICY_COUNT`/`PLUGIN_POLICY_REFS`: additive plugin-policy metadata (for example Calico and Cilium CRDs), not a full effective-policy evaluator.
-  - Native and plugin contexts are metadata for triage and are not a guaranteed end-to-end enforcement proof.
-- Status meanings:
-  - `EXPOSED`: unauthenticated access succeeded (highest risk).
-  - `AUTH_REQUIRED`: endpoint reachable but requires authentication/authorization.
-  - `DENIED_WITHOUT_CREDS`: endpoint reachable but denied by TLS/auth/path constraints.
-  - `BLOCKED_OR_UNREACHABLE`: network blocked, timed out, or no route.
-  - `TEST_ERROR`: probe could not complete reliably (missing tools, exec failure, ambiguous transport failure).
-  - `SKIPPED`: source pod missing required probe tools (`curl` and/or `timeout`), so no probes were attempted from that pod.
-- Exit/status mapping (how statuses are determined):
-  - `BLOCKED_OR_UNREACHABLE`: curl/timeout exit code in `{6,7,28,124}`.
-  - `DENIED_WITHOUT_CREDS`: curl exit code in `{51,58,60}` or HTTP `400/404` during auth probe stage.
-  - `TEST_ERROR`: other probe/exec failures or ambiguous transport failures.
-- Risk highlighting:
-  - `EXPOSED` findings are wrapped by:
-    - `=========ALERT=========`
-    - `<result line>`
-    - `=========ALERT=========`
-- Summaries:
-  - coverage counters (`pods considered/tested/skipped/sampled-out`)
-  - status rollups and per-port rollups
-  - pre/post API reachability and node count guard lines
-  - `UNKNOWN_POLICY_CRD_GROUPS` metadata for heuristic plugin coverage gaps
+- Uses `oc` when available, else `kubectl`.
+- Requires `jq`, `curl`, `timeout`; supports `--namespaces`, `--output`, timeout flags, and `--max-pods`.
+- Modes: `full` (control-plane + worker checks) and `worker_only` (worker checks only).
+- Outputs human table or JSONL; high-risk `EXPOSED` findings are clearly highlighted.
+- For full status taxonomy and probe logic, see the script header comments.
 
 ---
 
-## Subject access verifier script
+### Subject access verifier
 
 `check_subject_access.sh` evaluates effective RBAC exposure for a specific subject (`User`, `Group`, or `ServiceAccount`) and flags high-risk privilege patterns.
 
-- CLI behavior: uses `oc` when available, otherwise falls back to `kubectl`.
-- Additional flags:
-  - `--namespaces ns1,ns2`
-  - `--output human|jsonl`
-  - `--timeout N`
-  - `--connect-timeout N`
-- Inputs:
-  - `--kind <user|group|serviceaccount>`
-  - `--name <subject-name>` (for service accounts, supports `ns/name`)
-  - optional `--namespace`, `--groups`, `--output <human|json|both>`, `--no-prompt`
-- What it does:
-  - builds effective subject set (direct subject + optional groups)
-  - resolves matching `ClusterRoleBinding` and `RoleBinding` grants
-  - resolves referenced `ClusterRole`/`Role` rules
-  - emits findings for high-risk patterns (for example: `cluster-admin`, wildcard all, `bind`, `escalate`, impersonation, secret read, RBAC writes, node access)
-- Output/exit behavior:
-  - prints human-readable and/or JSON result set with findings summary
-  - exits `1` when high-risk findings are present, `0` otherwise
+- Uses `oc` when available, else `kubectl`.
+- Core inputs: `--kind`, `--name`; optional namespace/groups/output controls.
+- Resolves effective bindings and rules, then emits high-risk findings (`cluster-admin`, wildcards, `bind`, `escalate`, impersonation, secret access, etc.).
+- Exits `1` when high-risk findings are present, `0` otherwise.
 
 ---
 
-## Endpoint connectivity sweep script
+### Endpoint connectivity sweep
 
 `network_segreg_via_endpoints.sh` performs namespace-to-endpoint connectivity checks by selecting one running curl-capable source pod per namespace, then probing discovered service endpoints.
 
-- CLI behavior: uses `oc` when available, otherwise falls back to `kubectl`.
-- Discovery model:
-  - source pods: one exec-capable pod with `curl` per namespace
-  - targets: EndpointSlice API first, then Endpoints API fallback
-- Probe model:
-  - HTTP connectivity checks to each `endpointIP:port` using timeout-based `curl`
-  - per-source-pod result table plus cluster-wide summary counters
-- Status taxonomy:
-  - `EXPOSED`, `BLOCKED_OR_UNREACHABLE`, `DENIED_WITHOUT_CREDS`, `TEST_ERROR`
-  - `EXPOSED` is wrapped with alert lines in human mode; `risk=true` in jsonl mode
-- Source context model (additive):
-  - Native Kubernetes `NetworkPolicy` context: namespace policy count + selector-based policy matches for the selected source pod.
-  - Plugin policy context (if detected): Calico/Cilium CRD counts and references are surfaced as metadata alongside native context.
-  - Plugin metadata complements, not replaces, native `networking.k8s.io/v1` policy context.
-- Unknown policy-like CRD groups are surfaced as summary metadata to indicate potential coverage gaps.
-- Notable outputs:
-  - `SUCCESS`, `TIMED OUT`, `CONNECTION REFUSED/BAD RESPONSE`, `RECV FAILURE`, `UNKNOWN FAILURE`
-  - skipped namespaces list when no curl-capable source pod is available
+- Uses `oc` when available, else `kubectl`.
+- Selects one curl-capable source pod per namespace and probes discovered endpoints.
+- Reports `EXPOSED`, `BLOCKED_OR_UNREACHABLE`, `DENIED_WITHOUT_CREDS`, and `TEST_ERROR` with per-pod and cluster-wide summaries.
+- Includes additive NetworkPolicy/plugin metadata for triage (not a full enforcement proof).
 
 ---
 
@@ -171,9 +107,42 @@ These scripts inspect **declared** pod/namespace state. They are **not** full ad
 | **Azure CLI (`az`)** | Cluster credentials; **AKS-rbac.sh Check 2** (`AKS_*` env vars) |
 | **`terraform`** | Provisioning lab clusters and fixtures under `terraform/` |
 
-### Kubernetes access
+### Cluster access
 
 - A **kubeconfig** with a context that can **list namespaces** and **read** RBAC and workload objects (exact verbs depend on your role). The capabilities scripts fail early if `kubectl get ns` fails.
+
+### Configure `kubectl` for cloud clusters (EKS / GKE / AKS)
+
+If you’re targeting a managed cloud cluster, first ensure your kubeconfig has a working context for that cluster.
+
+**EKS (AWS)**
+
+```bash
+aws eks update-kubeconfig --name <cluster-name> --region <region>
+kubectl config current-context
+kubectl get ns
+```
+
+**GKE (GCP)**
+
+```bash
+gcloud container clusters get-credentials <cluster-name> --location <zone-or-region> --project <project-id>
+kubectl config current-context
+kubectl get ns
+```
+
+**AKS (Azure)**
+
+```bash
+az aks get-credentials --resource-group <rg> --name <cluster-name>
+kubectl config current-context
+kubectl get ns
+```
+
+Notes:
+
+- If you manage multiple kubeconfigs, use `KUBECONFIG=/path/to/kubeconfig` (or merge contexts) before running scripts.
+- If `kubectl get ns` fails, fix auth first (cloud login, exec plugin, expired tokens, wrong subscription/project, etc.)—the scripts assume basic API access is already working.
 
 ### OpenShift-only
 
@@ -183,11 +152,6 @@ These scripts inspect **declared** pod/namespace state. They are **not** full ad
 ---
 
 ## How to run (from repository root)
-
-```bash
-cd /path/to/Kube-fluff
-chmod +x *.sh   # once, if needed
-```
 
 ### RBAC scripts
 
@@ -199,6 +163,13 @@ chmod +x *.sh   # once, if needed
 ```
 
 The same flag style applies to **`EKS-rbac.sh`**, **`GKE-rbac.sh`**, **`AKS-rbac.sh`**, and **`OpenShift-RBAC.sh`**: `--checks`, `--list` / `--list-checks`, `--quiet`, `--critical`, `--debug-check20`, `--debug-check21`, `-h` / `--help`. **`Vanilla-RBAC.sh`** uses **`--debug-check18`** / **`--debug-check19`** for its workload-binding diagnostics (see `--help`).
+
+To confirm context quickly before any run:
+
+```bash
+kubectl config current-context
+kubectl get ns
+```
 
 **Override kubectl binary (RBAC scripts that use `K=`):**
 
@@ -254,6 +225,28 @@ cd ../..
 
 - **`terraform.tfvars`** is gitignored; use `*.example` files as templates.
 - See each stack’s **`outputs.tf`** for copy-paste **`run_rbac_audit`** / **`run_container_capabilities_audit`** examples (including exports for GKE/AKS Check 2).
+- If Terraform prints a kubeconfig command, run it first, then confirm:
+
+```bash
+kubectl config current-context
+kubectl get ns
+```
+
+---
+
+## Details appendix
+
+**RBAC performance note (`Vanilla-RBAC.sh`)**
+
+- Checks **3–19** reuse one prefetch of RBAC objects.
+- `--checks=1` and/or `2` skips that prefetch path.
+
+**Cloud “Check 2” scope**
+
+- **EKS:** reads **`kube-system/aws-auth`** mappings to **`system:masters`** (not a full AWS/EKS IAM inventory).
+- **GKE:** queries cluster IAM policy (`roles/container.clusterAdmin`, `roles/container.admin`) on the cluster resource; parent-level bindings may not appear.
+- **AKS:** queries role assignments at managed-cluster ARM scope; not a complete map of Azure authorization paths.
+- Scripts print a short scope line for Check 2 (unless `--quiet`).
 
 ---
 
